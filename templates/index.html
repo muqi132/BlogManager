@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+  <title>Blog Manager</title>
+  <script>try{document.documentElement.dataset.theme=localStorage.getItem("blog-manager-panel-theme")||(!matchMedia("(prefers-color-scheme: dark)").matches?"light":"dark")}catch(_e){document.documentElement.dataset.theme="light"}</script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/katex/katex.min.css') }}">
+  <link id="highlightLightTheme" rel="stylesheet" href="{{ url_for('static', filename='vendor/highlight.js/github.min.css') }}">
+  <link id="highlightDarkTheme" rel="stylesheet" href="{{ url_for('static', filename='vendor/highlight.js/github-dark.min.css') }}" disabled>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+  <svg class="svg-sprite" aria-hidden="true">
+    <symbol id="i-layout" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 9v12"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h2M10 12h10M4 18h8M16 18h4"/><circle cx="16" cy="6" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="14" cy="18" r="2"/></symbol>
+    <symbol id="i-palette" viewBox="0 0 24 24"><path d="M12 3a9 9 0 0 0 0 18h1.5a2 2 0 0 0 1.3-3.5 1.8 1.8 0 0 1 1.2-3.1H18a3.5 3.5 0 0 0 3-3.5C21 6.6 17 3 12 3Z"/><circle cx="7.5" cy="10" r="1"/><circle cx="10" cy="6.8" r="1"/><circle cx="14" cy="7" r="1"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3M13 15h4"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v9A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5Z"/></symbol>
+    <symbol id="i-folder-open" viewBox="0 0 24 24"><path d="M3 18.5V7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v1"/><path d="M4 19h14.5a2 2 0 0 0 1.9-1.4L22 11H6.5a2 2 0 0 0-1.9 1.4L3 17.5"/></symbol>
+    <symbol id="i-save" viewBox="0 0 24 24"><path d="M5 3h11l3 3v15H5z"/><path d="M8 3v6h7V3M8 21v-7h8v7"/></symbol>
+    <symbol id="i-rocket" viewBox="0 0 24 24"><path d="M14 4c3.5-2 6-2 6-2s0 2.5-2 6l-5.5 5.5-4.5 1-1-4.5Z"/><path d="m12 10 2 2M8 15l-3 3M6 18l-3 1 1-3"/><circle cx="16.5" cy="7.5" r="1.5"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m10 8 6 4-6 4Z"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><rect x="9" y="9" width="6" height="6" rx="1"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5Z"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m7 10 5 5 5-5"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="m9 18-6-6 6-6M15 6l6 6-6 6"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v5h5M9 13h6M9 17h5"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="8" cy="9" r="1.5"/><path d="m5 18 5-5 3 3 2-2 4 4"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M6.1 9A7 7 0 0 1 18.5 7.5L20 11M4 13l1.5 3.5A7 7 0 0 0 18 15"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10Z"/><path d="m14 7 3 3"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m16 16 5 5"/></symbol>
+    <symbol id="i-cubes" viewBox="0 0 24 24"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9Z"/><path d="m4 7.5 8 4.5 8-4.5M12 12v9"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.2 1.2"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.2-1.2"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M5 20h14"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></symbol>
+  </svg>
+
+  <section class="welcome-screen" id="welcomeScreen">
+    <div class="welcome-card">
+      <div class="welcome-brand">
+        <div class="brand-mark large"><svg viewBox="0 0 24 24"><path d="M14.5 4.5 19.5 9.5 10 19H5v-5Z"/><path d="m13 6 5 5M5 19l-1 1"/></svg></div>
+        <div><strong>Blog Manager</strong><span>Hexo + Butterfly 本地控制台</span></div>
+      </div>
+      <div class="welcome-grid">
+        <section class="welcome-recent">
+          <div class="welcome-section-title"><span>最近打开</span><small>最多显示 5 个</small></div>
+          <div class="recent-list" id="recentList"></div>
+          <div class="welcome-empty hidden" id="recentEmpty">还没有最近打开的博客文件夹</div>
+        </section>
+        <section class="welcome-actions">
+          <button class="welcome-action primary-action" id="welcomeOpenExisting" type="button"><span class="welcome-action-icon"><svg><use href="#i-folder-open"></use></svg></span><span><strong>打开已有博客</strong><small>选择包含 _config.yml 的 Hexo 目录</small></span></button>
+          <button class="welcome-action" id="welcomeNewBlog" type="button"><span class="welcome-action-icon"><svg><use href="#i-cubes"></use></svg></span><span><strong>新建博客（自动部署）</strong><small>选择空目录，自动安装 Hexo + Butterfly</small></span></button>
+          <button class="welcome-action" id="welcomeCloneBlog" type="button"><span class="welcome-action-icon"><svg><use href="#i-code"></use></svg></span><span><strong>克隆远程博客</strong><small>从 Git 仓库克隆已有站点</small></span></button>
+        </section>
+      </div>
+      <div class="welcome-footer"><label class="check-row"><input type="checkbox" id="rememberLastFolder"><span>记住上次打开的文件夹</span></label><div class="welcome-footer-actions"><button class="text-button danger-hover" id="resetLocalConfigButton" type="button">清理本地配置</button><span>Blog Manager v1.2 · 本地工具</span></div></div>
+    </div>
+  </section>
+
+  <dialog class="app-dialog onboarding-dialog" id="firstRunDialog">
+    <form id="firstRunForm">
+      <div class="dialog-heading-row onboarding-heading"><div class="dialog-icon"><svg><use href="#i-rocket"></use></svg></div><div><span class="eyebrow">FIRST RUN</span><h2>首次使用设置</h2><p>配置会保存在当前用户目录，不会写入项目源码。</p></div></div>
+      <div class="onboarding-grid">
+        <label class="field span-2"><span class="field-label">博客文件夹 <em>必填</em></span><div class="target-picker-row"><input type="text" id="firstRunBlogPath" readonly placeholder="请选择包含 _config.yml 的 Hexo 目录"><button class="button secondary" id="firstRunSelectFolder" type="button">选择文件夹</button></div></label>
+        <label class="field"><span class="field-label">GitHub 用户名 <em>可选</em></span><input type="text" id="firstRunGithubUsername" autocomplete="off" placeholder="例如：your-name"></label>
+        <label class="field"><span class="field-label">部署分支 <em>可选</em></span><input type="text" id="firstRunBranch" value="main" autocomplete="off"></label>
+        <label class="field span-2"><span class="field-label">GitHub 仓库地址 <em>可选</em></span><input type="text" id="firstRunRepoUrl" autocomplete="off" placeholder="git@github.com:你的用户名/仓库名.git"></label>
+        <label class="field span-2"><span class="field-label">GitHub Personal Access Token <em>可选</em></span><input type="password" id="firstRunGithubToken" autocomplete="off" placeholder="如已保存，不会在界面回显"></label>
+      </div>
+      <label class="check-row"><input type="checkbox" id="firstRunRememberToken"><span>将 Token 保存到本机用户配置文件</span></label>
+      <div class="notice warning onboarding-notice"><svg><use href="#i-info"></use></svg><div><strong>隐私提示</strong><span>Token 仅保存在本机用户目录，采用明文存储。请勿把配置文件分享给他人。</span></div></div>
+      <div class="dialog-actions onboarding-actions"><button class="button secondary" id="skipFirstRunButton" type="button">稍后设置</button><button class="button primary" id="completeFirstRunButton" type="button">完成设置</button></div>
+    </form>
+  </dialog>
+
+  <div class="app-shell hidden" id="appShell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"><svg viewBox="0 0 24 24"><path d="M14.5 4.5 19.5 9.5 10 19H5v-5Z"/><path d="m13 6 5 5M5 19l-1 1"/></svg></div>
+        <div><strong>Blog Manager</strong><span>Hexo Control Center</span></div>
+      </div>
+      <nav class="nav-list" aria-label="主导航">
+        <p class="nav-label">工作区</p>
+        <button class="nav-item active" type="button" data-section="site"><svg><use href="#i-sliders"></use></svg><span>站点配置</span></button>
+        <button class="nav-item" type="button" data-section="theme"><svg><use href="#i-palette"></use></svg><span>主题配置</span></button>
+        <button class="nav-item" type="button" data-section="posts"><svg><use href="#i-file"></use></svg><span>文章管理</span></button>
+        <button class="nav-item" type="button" data-section="images"><svg><use href="#i-image"></use></svg><span>图片管理</span></button>
+        <button class="nav-item" type="button" data-section="operations"><svg><use href="#i-terminal"></use></svg><span>操作</span></button>
+      </nav>
+      <div class="sidebar-note">
+        <span class="status-dot" id="serverDot"></span>
+        <div><strong id="serverLabel">正在连接</strong><small>本地服务仅监听 127.0.0.1</small></div>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div class="path-area">
+          <span class="path-eyebrow">当前博客</span>
+          <button class="path-display" id="pathDisplay" type="button" title="打开博客文件夹">
+            <svg><use href="#i-folder"></use></svg><span id="pathText">正在读取...</span>
+          </button>
+        </div>
+        <div class="topbar-actions">
+          <button class="button secondary" id="selectFolderButton" type="button"><svg><use href="#i-folder-open"></use></svg><span>选择博客文件夹</span></button>
+          <button class="icon-button" id="themeToggle" type="button" title="切换界面主题" aria-label="切换界面主题">
+            <svg class="theme-icon-light"><use href="#i-sun"></use></svg><svg class="theme-icon-dark"><use href="#i-moon"></use></svg>
+          </button>
+          <button class="icon-button danger-hover" id="exitButton" type="button" title="退出应用" aria-label="退出应用"><svg><use href="#i-x"></use></svg></button>
+        </div>
+      </header>
+
+      <div class="content-scroll" id="contentScroll">
+        <section class="page-section active" id="section-site" data-section-panel="site">
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">SITE CONFIGURATION</span>
+              <h1>站点配置</h1>
+              <p>覆盖 Hexo 的常用站点、写作、分页和部署配置；复杂字段可切换到完整 YAML 模式。</p>
+            </div>
+            <div class="heading-actions"><span class="file-chip">_config.yml</span><span class="save-state" id="siteSaveHint">等待加载配置</span><div class="segmented" id="siteModeSwitch" role="group" aria-label="站点配置编辑模式"><button type="button" class="active" data-mode="fields">表单</button><button type="button" data-mode="raw">YAML</button></div><button class="button primary" type="submit" form="siteForm" id="saveSiteButton"><svg><use href="#i-save"></use></svg><span>保存站点配置</span></button></div>
+          </div>
+          <div class="notice warning hidden" id="siteConfigNotice"><svg><use href="#i-folder"></use></svg><div><strong>未找到 _config.yml</strong><span>请确认当前文件夹是 Hexo 博客根目录，然后重新选择。</span></div></div>
+          <form id="siteForm">
+            <datalist id="timezoneOptions"><option value="Asia/Shanghai"></option><option value="Asia/Hong_Kong"></option><option value="Asia/Taipei"></option><option value="Asia/Tokyo"></option><option value="UTC"></option><option value="Europe/London"></option><option value="America/New_York"></option></datalist>
+            <div class="config-groups" id="siteFields"></div>
+            <div class="raw-editor hidden" id="siteRawEditor">
+              <div class="editor-bar"><span>_config.yml</span><span>完整 YAML · UTF-8</span></div>
+              <textarea id="siteRawYaml" spellcheck="false" aria-label="站点完整 YAML"></textarea>
+            </div>
+
+          </form>
+        </section>
+
+        <section class="page-section" id="section-theme" data-section-panel="theme">
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">BUTTERFLY THEME</span>
+              <h1>主题配置</h1>
+              <p>合并读取主题完整配置和根目录覆盖文件，常用字段可视化编辑，完整内容可使用 YAML 模式。</p>
+            </div>
+            <div class="heading-actions"><span class="file-chip">_config.butterfly.yml</span><span class="save-state" id="themeSaveHint">等待加载配置</span><div class="segmented" id="themeModeSwitch" role="group" aria-label="主题配置编辑模式"><button type="button" class="active" data-mode="fields">表单</button><button type="button" data-mode="raw">YAML</button></div><button class="button primary" type="submit" form="themeForm" id="saveThemeButton"><svg><use href="#i-save"></use></svg><span>保存主题配置</span></button></div>
+          </div>
+          <div class="notice warning hidden" id="themeConfigNotice"><svg><use href="#i-folder"></use></svg><div><strong>未找到 Butterfly 配置</strong><span>未发现主题目录配置文件或根目录覆盖文件。</span></div></div>
+          <div class="notice info source-notice" id="themeSourceNotice"><svg><use href="#i-code"></use></svg><div><strong>配置合并来源</strong><span id="themeSourceText">正在读取...</span></div></div>
+          <form id="themeForm">
+            <div class="config-groups" id="themeFields"></div>
+
+            <div class="settings-card menu-card">
+              <div class="card-heading menu-heading">
+                <div><h2>导航菜单</h2><p>可视化维护名称、链接与图标；复杂子菜单可切换到 YAML 模式。</p></div>
+              </div>
+              <div class="notice info hidden" id="menuComplexNotice"><svg><use href="#i-code"></use></svg><div><strong>检测到复杂菜单结构</strong><span>当前菜单包含子菜单或非文本值，已自动切换到 YAML 模式。</span></div></div>
+              <div id="menuItemsEditor">
+                <div class="menu-column-head"><span>名称</span><span>链接</span><span>图标 Class</span><span></span></div>
+                <div class="menu-items" id="menuItems"></div>
+                <button class="button ghost add-menu-button" type="button" id="addMenuItemButton"><svg><use href="#i-plus"></use></svg><span>添加菜单项</span></button>
+              </div>
+            </div>
+
+            <div class="settings-card menu-card">
+              <div class="card-heading menu-heading">
+                <div><h2>社交链接</h2><p>格式为图标 Class、链接、描述和品牌颜色。</p></div>
+              </div>
+              <div class="notice info hidden" id="socialComplexNotice"><svg><use href="#i-code"></use></svg><div><strong>检测到复杂社交配置</strong><span>请在 YAML 模式中维护该字段。</span></div></div>
+              <div id="socialItemsEditor">
+                <div class="social-column-head"><span>图标 Class</span><span>链接</span><span>描述</span><span>颜色</span><span></span></div>
+                <div class="social-items" id="socialItems"></div>
+                <button class="button ghost add-menu-button" type="button" id="addSocialItemButton"><svg><use href="#i-plus"></use></svg><span>添加社交链接</span></button>
+              </div>
+            </div>
+
+            <div class="raw-editor hidden" id="themeRawEditor">
+              <div class="editor-bar"><span>完整有效主题配置 → 保存到 _config.butterfly.yml</span><span>YAML · UTF-8</span></div>
+              <textarea id="themeRawYaml" spellcheck="false" aria-label="主题完整 YAML"></textarea>
+            </div>
+
+          </form>
+        </section>
+
+        <section class="page-section" id="section-posts" data-section-panel="posts">
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">POST LIBRARY</span>
+              <h1>文章管理</h1>
+              <p>按真实目录树管理 source/_posts，支持新建、内置 Markdown + LaTeX 编辑和安全回收。</p>
+            </div>
+            <div class="heading-actions">
+              <button class="button secondary" id="refreshPostsButton" type="button"><svg><use href="#i-refresh"></use></svg><span>刷新</span></button>
+              <button class="button secondary" id="checkFrontmatterButton" type="button"><svg><use href="#i-check"></use></svg><span>检查并修复属性</span></button>
+              <span class="selection-hint hidden" id="postSelectionHint">已选中 0 篇</span>
+              <button class="button ghost hidden" id="clearPostSelectionButton" type="button">清空选中</button>
+              <button class="button primary" id="newPostButton" type="button"><svg><use href="#i-plus"></use></svg><span>新建文章</span></button>
+            </div>
+          </div>
+          <div class="posts-layout">
+            <aside class="settings-card folder-panel">
+              <div class="panel-heading"><strong>文件夹</strong><button class="icon-button small" id="refreshPostTreeButton" type="button" title="刷新"><svg><use href="#i-refresh"></use></svg></button></div>
+              <div class="folder-tree" id="postFolderTree"></div>
+            </aside>
+            <div class="posts-content">
+              <div class="toolbar">
+                <label class="search-box"><svg><use href="#i-search"></use></svg><input type="search" id="postSearch" placeholder="搜索标题或文件名"></label>
+                <span class="toolbar-count" id="postCountLabel">0 篇文章</span>
+              </div>
+              <div class="settings-card list-card post-list-card" id="postListCard">
+                <div class="list-head post-list-head"><span class="post-select-head hidden" id="postSelectHead"><input type="checkbox" id="postSelectAll" aria-label="全选当前列表"></span><span>文章</span><span>日期</span><span>操作</span></div>
+                <div class="data-list" id="postList"></div>
+                <div class="empty-state hidden" id="postEmptyState"><strong>没有找到文章</strong><span>点击“新建文章”开始写作。</span></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="page-section" id="section-images" data-section-panel="images">
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">MEDIA LIBRARY</span>
+              <h1>图片管理</h1>
+              <p>预览 source/img 中的图片，并快速在文件资源管理器中打开所在目录。</p>
+            </div>
+            <div class="heading-actions">
+              <button class="button secondary" id="openImagesFolderButton" type="button"><svg><use href="#i-folder-open"></use></svg><span>打开图片目录</span></button>
+              <button class="button secondary" id="refreshImagesButton" type="button"><svg><use href="#i-refresh"></use></svg><span>刷新</span></button>
+            </div>
+          </div>
+          <div class="toolbar">
+            <label class="search-box"><svg><use href="#i-search"></use></svg><input type="search" id="imageSearch" placeholder="搜索图片名称或路径"></label>
+            <span class="toolbar-count" id="imageCountLabel">0 张图片</span>
+          </div>
+          <div class="image-grid" id="imageGrid"></div>
+          <div class="empty-state settings-card hidden" id="imageEmptyState"><strong>没有找到图片</strong><span>请确认 source/img 目录中存在图片文件。</span></div>
+        </section>
+
+        <section class="page-section" id="section-operations" data-section-panel="operations">
+          <div class="page-heading">
+            <div><span class="eyebrow">COMMANDS</span><h1>操作</h1><p>在当前博客目录执行 Hexo 命令，输出会实时显示在底部日志面板。</p></div>
+            <div class="heading-actions"><button class="button secondary" id="openFrontmatterButton" type="button"><svg><use href="#i-file"></use></svg><span>编辑 Front-matter</span></button><span class="status-pill neutral" id="previewStatusPill"><span></span>预览未运行</span></div>
+          </div>
+          <div class="action-grid">
+            <article class="action-card deploy-card" id="deployCard">
+              <div class="action-icon"><svg><use href="#i-rocket"></use></svg></div>
+              <div class="action-copy"><span class="action-kicker">PUBLISH</span><h2>一键部署</h2><p>依次执行 <code>hexo clean</code> 与 <code>hexo deploy</code>。存在未保存配置时会先询问。</p><div class="command-line"><span>$</span> hexo clean &amp;&amp; hexo deploy</div></div>
+              <button class="button primary full-width" type="button" id="deployButton"><svg><use href="#i-rocket"></use></svg><span>开始部署</span></button>
+            </article>
+            <article class="action-card preview-card">
+              <div class="action-icon"><svg><use href="#i-play"></use></svg></div>
+              <div class="action-copy"><span class="action-kicker">DEVELOP</span><h2>本地预览</h2><p>依次执行 hexo clean、hexo generate，再启动 Hexo 本地服务；端口占用时会提示新的可用端口。</p><div class="port-row"><label for="previewPort">端口</label><input type="number" id="previewPort" min="1024" max="65535" value="4000"><span id="previewPortState">等待检查</span></div><div class="command-line stacked"><span>$</span> hexo clean<br><span>$</span> hexo generate<br><span>$</span> hexo server -p 4000</div></div>
+              <div class="button-row preview-actions"><button class="button primary" type="button" id="previewButton"><svg><use href="#i-play"></use></svg><span>启动预览</span></button><button class="button secondary" type="button" id="forceGenerateButton"><svg><use href="#i-refresh"></use></svg><span>强制重新生成</span></button><button class="button secondary" type="button" id="stopPreviewButton" disabled><svg><use href="#i-stop"></use></svg><span>停止</span></button></div>
+            </article>
+            <article class="action-card utility-card">
+              <div class="action-icon soft"><svg><use href="#i-folder-open"></use></svg></div>
+              <div class="action-copy"><span class="action-kicker">EXPLORER</span><h2>打开博客文件夹</h2><p>在 Windows 文件资源管理器中打开当前选中的博客根目录。</p></div>
+              <button class="button secondary full-width" type="button" id="openFolderButton"><svg><use href="#i-external"></use></svg><span>在资源管理器中打开</span></button>
+            </article>
+            <article class="action-card auto-deploy-card">
+              <div class="action-icon"><svg><use href="#i-cubes"></use></svg></div>
+              <div class="action-copy"><span class="action-kicker">AUTOMATION</span><h2>自动部署 Hexo + Butterfly</h2><p>从空文件夹开始，自动初始化 Hexo、安装 Butterfly、应用当前配置并安装依赖。</p><div class="command-line"><span>$</span> hexo init → Butterfly → npm install → 检查渲染器 → hexo generate</div></div>
+              <button class="button primary full-width" type="button" id="autoDeployButton"><svg><use href="#i-rocket"></use></svg><span>打开自动部署向导</span></button>
+            </article>          </div>
+        </section>
+      </div>
+
+      <section class="log-panel" id="logPanel">
+        <header class="log-header">
+          <div class="log-heading"><span class="terminal-mark"><svg><use href="#i-terminal"></use></svg></span><div><strong>运行日志</strong><small id="logSubtitle">等待命令</small></div></div>
+          <div class="log-actions"><span class="task-status hidden" id="taskStatus"><span></span><b>运行中</b></span><button class="text-button" id="copyLogButton" type="button">复制</button><button class="text-button" id="clearLogButton" type="button">清空</button><button class="icon-button small collapse-log-button" id="collapseLogButton" type="button" title="折叠日志" aria-label="折叠日志"><svg><use href="#i-chevron"></use></svg></button></div>
+        </header>
+        <div class="log-output" id="logOutput" role="log" aria-live="polite"><div class="log-placeholder" id="logPlaceholder"><svg><use href="#i-terminal"></use></svg><span>部署或预览命令的输出会显示在这里</span></div></div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast-stack" id="toastStack" aria-live="polite"></div>
+
+  <dialog class="app-dialog" id="exitDialog"><form method="dialog"><div class="dialog-icon"><svg><use href="#i-x"></use></svg></div><h2>退出 Blog Manager？</h2><p>正在运行的预览或部署任务也会被停止，然后关闭本地服务。</p><div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button class="button danger" value="confirm" id="confirmExitButton">退出应用</button></div></form></dialog>
+
+  <dialog class="app-dialog" id="unsavedDialog"><form method="dialog"><div class="dialog-icon warning-icon"><svg><use href="#i-save"></use></svg></div><h2>有未保存的配置修改</h2><p>继续部署会使用磁盘上已经保存的配置，未保存的表单内容不会生效。</p><div class="dialog-actions"><button class="button secondary" value="cancel">返回保存</button><button class="button primary" value="confirm" id="deployAnywayButton">仍然部署</button></div></form></dialog>
+
+  <dialog class="app-dialog" id="newPostDialog">
+    <form method="dialog" id="newPostForm">
+      <div class="dialog-icon"><svg><use href="#i-file"></use></svg></div><h2>新建文章</h2><p>将在 source/_posts 中创建 Markdown 文件和 Front Matter。</p>
+      <label class="field"><span class="field-label">标题</span><input type="text" id="newPostTitle" placeholder="文章标题" required></label>
+      <label class="field"><span class="field-label">文件名 <em>可选</em></span><input type="text" id="newPostFilename" placeholder="默认根据标题生成" autocomplete="off"></label>
+      <label class="field"><span class="field-label">保存文件夹</span><select id="newPostFolder"></select></label>
+      <label class="field hidden" id="newPostFolderCustomField"><span class="field-label">新文件夹名称</span><input type="text" id="newPostFolderCustom" placeholder="例如：技术/Hexo"></label>
+      <label class="field"><span class="field-label">分类 <em>逗号分隔</em></span><input type="text" id="newPostCategories" placeholder="技术, Hexo" autocomplete="off"></label>
+      <label class="field"><span class="field-label">标签 <em>逗号分隔</em></span><input type="text" id="newPostTags" placeholder="博客, 前端" autocomplete="off"></label>
+      <div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button class="button primary" value="confirm" id="confirmNewPostButton">创建文章</button></div>
+    </form>
+  </dialog>
+
+  <dialog class="image-dialog" id="imageDialog">
+    <div class="image-dialog-toolbar">
+      <div class="image-tools">
+        <button class="icon-button small" id="imageZoomOut" type="button" title="缩小">−</button>
+        <button class="icon-button small" id="imageZoomIn" type="button" title="放大">+</button>
+        <button class="icon-button small" id="imageReset" type="button" title="重置">1:1</button>
+        <button class="icon-button small" id="imageRotateLeft" type="button" title="向左旋转">↺</button>
+        <button class="icon-button small" id="imageRotateRight" type="button" title="向右旋转">↻</button>
+      </div>
+      <div class="image-name-overlay" id="imageNameOverlay"><span class="image-name-text" id="imageNameText" title="双击重命名"></span><span class="image-name-edit hidden" id="imageNameEdit"><input id="imageNameInput" type="text" spellcheck="false"><span class="image-name-extension" id="imageNameExtension"></span></span></div>
+      <button class="image-dialog-close" id="closeImageDialogButton" type="button" aria-label="关闭预览"><svg><use href="#i-x"></use></svg></button>
+    </div>
+    <div class="image-viewport" id="imageViewport"><img id="imagePreview" alt="" draggable="false"></div>
+    <div class="image-dialog-caption" id="imagePreviewCaption"></div>
+  </dialog>
+
+  <dialog class="markdown-dialog" id="markdownDialog">
+    <header class="markdown-toolbar">
+      <div class="markdown-title-wrap"><span class="markdown-icon"><svg><use href="#i-file"></use></svg></span><div><strong id="markdownTitle">文章编辑</strong><small id="markdownPath"></small></div></div>
+      <div class="markdown-status" id="markdownStatus">已加载</div>
+      <div class="markdown-actions"><button class="button secondary" id="closeMarkdownButton" type="button">关闭</button><button class="button primary" id="saveMarkdownButton" type="button"><svg><use href="#i-save"></use></svg><span>保存文章</span></button></div>
+    </header>
+    <div class="markdown-workspace" id="markdownWorkspace">
+      <section class="markdown-pane">
+        <div class="pane-header"><span>Markdown 源码</span><span>Ctrl+B / Ctrl+I / Ctrl+K / Ctrl+S</span></div>
+        <div class="markdown-source-wrap">
+          <pre class="markdown-line-numbers" id="markdownLineNumbers"></pre>
+          <div class="markdown-source-layer"><pre class="markdown-highlight" id="markdownHighlight" aria-hidden="true"></pre><textarea id="markdownSource" spellcheck="false"></textarea></div>
+        </div>
+      </section>
+      <div class="markdown-resizer" id="markdownResizer" title="拖动调整宽度"></div>
+      <section class="markdown-pane">
+        <div class="pane-header"><span>实时预览</span><span id="markdownPreviewMeta">KaTeX / MathJax</span></div>
+        <article class="markdown-preview" id="markdownPreview"></article>
+      </section>
+    </div>
+  </dialog>
+
+  <dialog class="frontmatter-dialog" id="frontmatterDialog">
+    <header class="frontmatter-header">
+      <div><span class="eyebrow">PROPERTIES</span><h2>编辑文章属性</h2><p id="frontmatterPath">选择一篇文章开始编辑 front-matter。</p></div>
+      <button class="icon-button" id="closeFrontmatterButton" type="button" aria-label="关闭属性面板"><svg><use href="#i-x"></use></svg></button>
+    </header>
+    <div class="frontmatter-body">
+      <aside class="frontmatter-sidebar">
+        <label class="search-box"><svg><use href="#i-search"></use></svg><input type="search" id="frontmatterSearch" placeholder="搜索文章标题或路径"></label>
+        <div class="frontmatter-post-list" id="frontmatterPostList"></div>
+      </aside>
+      <section class="frontmatter-editor">
+        <div class="frontmatter-empty" id="frontmatterEmpty"><svg><use href="#i-file"></use></svg><strong>请选择一篇文章</strong><span>左侧列表可按标题、文件名或路径筛选。</span></div>
+        <div class="hidden" id="frontmatterEditorContent">
+          <div class="notice warning hidden" id="frontmatterWarning"><svg><use href="#i-info"></use></svg><div><strong>需要处理 front-matter</strong><span id="frontmatterWarningText"></span></div></div>
+          <div class="frontmatter-properties" id="frontmatterProperties"></div>
+          <button class="button secondary add-frontmatter-button" id="addFrontmatterPropertyButton" type="button"><svg><use href="#i-plus"></use></svg><span>添加新属性</span></button>
+        </div>
+      </section>
+    </div>
+    <footer class="frontmatter-footer"><span id="frontmatterSaveHint"></span><div class="dialog-actions"><button class="button secondary" id="cancelFrontmatterButton" type="button">取消</button><button class="button primary" id="saveFrontmatterButton" type="button"><svg><use href="#i-save"></use></svg><span>保存属性</span></button></div></footer>
+  </dialog>
+
+  <dialog class="cover-dialog" id="coverDialog">
+    <header class="cover-header"><div><span class="eyebrow">COVER</span><h2>更换封面</h2><p id="coverPostPath">选择一篇文章</p></div><button class="icon-button" id="closeCoverButton" type="button" aria-label="关闭封面对话框"><svg><use href="#i-x"></use></svg></button></header>
+    <div class="cover-current"><div class="cover-preview"><img id="coverPreviewImage" alt="当前封面"><span id="coverPreviewEmpty"><svg><use href="#i-image"></use></svg>未设置封面</span></div><div class="cover-current-copy"><span>当前 cover 字段</span><code id="coverCurrentValue">未设置</code><small id="coverExternalHint"></small></div></div>
+    <div class="cover-library-heading"><strong>图片库</strong><span>点击图片选择封面，再次点击可取消选择</span></div>
+    <div class="cover-library" id="coverLibrary"></div>
+    <footer class="cover-footer"><button class="button secondary hidden" id="removeCoverButton" type="button"><svg><use href="#i-trash"></use></svg><span>移除封面</span></button><div class="cover-footer-actions"><button class="button secondary" id="addCoverUrlButton" type="button"><svg><use href="#i-link"></use></svg><span>从 URL 添加图片</span></button><button class="button secondary" id="uploadCoverButton" type="button"><svg><use href="#i-upload"></use></svg><span>上传本地图片</span></button><button class="button secondary" id="cancelCoverButton" type="button">取消</button><button class="button primary" id="confirmCoverButton" type="button"><svg><use href="#i-check"></use></svg><span>确认</span></button></div></footer>
+    <input class="hidden" type="file" id="coverFileInput" accept=".jpg,.jpeg,.png,.webp,.gif">
+  </dialog>
+
+  <dialog class="app-dialog autodeploy-dialog" id="autodeployDialog">
+    <form method="dialog" id="autodeployForm">
+      <div class="dialog-heading-row"><div class="dialog-icon"><svg><use href="#i-cubes"></use></svg></div><div><h2>自动部署 Hexo + Butterfly</h2><p>从空文件夹创建完整博客，或更新已有 Hexo 项目。</p></div></div>
+      <div class="target-picker-row"><input type="text" id="autoDeployTarget" readonly placeholder="请选择目标文件夹"><button class="button secondary" id="autoDeploySelectFolder" type="button">选择文件夹</button></div>
+      <div class="preflight-grid" id="autoDeployPreflight"><span>正在检查 Node.js</span><span>正在检查 npm</span><span>正在检查 Git</span></div>
+      <div class="form-grid autodeploy-fields">
+        <label class="field"><span class="field-label">站点标题</span><input type="text" id="autoDeployTitle" autocomplete="off"></label>
+        <label class="field"><span class="field-label">作者</span><input type="text" id="autoDeployAuthor" autocomplete="off"></label>
+        <label class="field span-2"><span class="field-label">站点 URL</span><input type="text" id="autoDeployUrl" autocomplete="off"></label>
+        <label class="field span-2"><span class="field-label">GitHub 仓库地址</span><input type="text" id="autoDeployRepo" autocomplete="off" placeholder="https://github.com/username/username.github.io.git"></label>
+        <label class="field"><span class="field-label">部署分支</span><input type="text" id="autoDeployBranch" autocomplete="off" value="main"></label>
+        <label class="field"><span class="field-label">主题源</span><select id="autoDeployThemeSource"><option value="github">GitHub 官方源</option><option value="gitee">Gitee 镜像</option><option value="ghproxy">GitHub 加速代理 · ghproxy</option><option value="moeyy">GitHub 加速代理 · moeyy</option><option value="gh-proxy">GitHub 加速代理 · gh-proxy</option><option value="custom">自定义 URL</option></select></label>
+        <label class="field span-2"><span class="field-label">Butterfly 主题仓库</span><input type="text" id="autoDeployThemeRepo" autocomplete="off"></label>
+      </div>
+      <div class="github-settings">
+        <label class="check-row"><input type="checkbox" id="autoDeployCreateRepo" checked><span>自动创建远程仓库（需要 GitHub Personal Access Token）</span></label>
+        <label class="check-row"><input type="checkbox" id="autoDeployRepoPrivate"><span>创建为私有仓库</span></label>
+        <label class="field"><span class="field-label">GitHub Personal Access Token</span><input type="password" id="autoDeployGithubToken" autocomplete="off" placeholder="github_pat_... 或 ghp_..."></label>
+        <label class="check-row"><input type="checkbox" id="autoDeploySaveToken"><span>保存 Token 到本地配置（明文存储，谨慎使用）</span></label>
+        <div class="github-hint" id="autoDeployGithubHint">仓库地址会根据站点 URL 自动推导；也可手动修改。</div>
+      </div>
+      <label class="check-row"><input type="checkbox" id="autoDeployOverwrite"><span>已有 Hexo 项目时覆盖站点配置和主题覆盖配置</span></label>
+      <label class="check-row"><input type="checkbox" id="autoDeployCopyContent"><span>同时复制当前博客的文章和图片</span></label>
+      <label class="check-row"><input type="checkbox" id="autoDeployLocalOnly"><span>仅本地创建（不配置远程仓库，完成后只提供本地预览）</span></label>
+      <div class="notice info autodeploy-notice" id="autoDeployNotice"><svg><use href="#i-info"></use></svg><div><strong>执行内容</strong><span>初始化 Hexo → 克隆 Butterfly → npm install → 安装并检查渲染器 → 应用配置 → hexo generate。全过程将在独立进度页实时显示。</span></div></div>
+      <div class="dialog-actions"><button class="button secondary" id="closeAutoDeployDialog" type="button">取消</button><button class="button primary" id="startAutoDeployButton" type="button">开始自动部署</button></div>
+    </form>
+  </dialog>
+  <dialog class="app-dialog" id="cloneBlogDialog">
+    <form method="dialog" id="cloneBlogForm">
+      <div class="dialog-icon"><svg><use href="#i-code"></use></svg></div>
+      <h2>克隆远程博客</h2>
+      <p>克隆 Git 仓库到空目录，并执行 npm install。</p>
+      <div class="target-picker-row"><input type="text" id="cloneTarget" readonly placeholder="选择空文件夹"><button class="button secondary" id="cloneSelectFolder" type="button">选择文件夹</button></div>
+      <label class="field"><span class="field-label">Git 仓库地址</span><input type="text" id="cloneRepoUrl" placeholder="https://github.com/user/blog.git" autocomplete="off"></label>
+      <label class="field"><span class="field-label">分支</span><input type="text" id="cloneBranch" placeholder="main" autocomplete="off"></label>
+      <div class="dialog-actions"><button class="button secondary" id="closeCloneDialog" type="button">取消</button><button class="button primary" id="startCloneButton" type="button">开始克隆</button></div>
+    </form>
+  </dialog>
+  <dialog class="app-dialog" id="themeNetworkDialog">
+    <form method="dialog">
+      <div class="dialog-icon warning-icon"><svg><use href="#i-info"></use></svg></div>
+      <h2>主题源当前不可达</h2>
+      <p>无法连接到 GitHub 主题源。可以改用国内镜像、暂时跳过主题克隆，或取消本次部署。</p>
+      <div class="source-status-list" id="themeNetworkSources"></div>
+      <div class="dialog-actions vertical-actions">
+        <button class="button primary" id="useThemeMirrorButton" type="button">使用国内镜像源</button>
+        <button class="button secondary" id="skipThemeButton" type="button">跳过主题克隆</button>
+        <button class="button secondary" value="cancel">取消部署</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog class="app-dialog" id="previewDependencyDialog">
+    <form method="dialog">
+      <div class="dialog-icon warning-icon"><svg><use href="#i-info"></use></svg></div>
+      <h2>本地预览依赖未通过</h2>
+      <p>Hexo 可能无法正确渲染 Butterfly 的 Pug 模板。请先修复渲染器依赖并重新生成静态文件。</p>
+      <div class="source-status-list" id="previewDependencyIssues"></div>
+      <div class="dialog-actions"><button class="button secondary" value="cancel">暂不预览</button><button class="button primary" id="repairPreviewDependenciesButton" type="button">修复依赖并生成</button></div>
+    </form>
+  </dialog>
+  <dialog class="autodeploy-progress-dialog" id="autodeployProgressDialog">
+    <div class="progress-page">
+      <header class="progress-header">
+        <div><span class="eyebrow">AUTODEPLOY</span><h2>正在自动部署 Hexo + Butterfly</h2><p id="progressCurrentStep">准备部署环境...</p></div>
+        <button class="button secondary danger-hover" id="cancelAutodeployButton" type="button">取消部署</button>
+      </header>
+      <div class="progress-main">
+        <section class="progress-steps-panel">
+          <div class="progress-summary"><strong id="progressCount">0/0 步</strong><span id="progressPercent">0%</span></div>
+          <div class="progress-track"><span id="progressBar"></span></div>
+          <div class="progress-steps" id="progressSteps"></div>
+        </section>
+        <section class="progress-log-panel">
+          <div class="pane-header"><span>实时日志</span><span>自动滚动</span></div>
+          <div class="progress-log" id="progressLog"><div class="progress-log-empty">等待步骤输出...</div></div>
+        </section>
+      </div>
+      <footer class="progress-footer hidden" id="progressResult">
+        <div class="progress-result-copy"><strong id="progressResultTitle"></strong><span id="progressResultText"></span>
+          <label class="progress-retry-source hidden" id="progressThemeSourceWrap"><span>重试主题源</span><select id="progressThemeSource"><option value="__current__">保持当前源</option><option value="github">GitHub 官方源</option><option value="gitee">Gitee 镜像</option><option value="ghproxy">GitHub 加速代理 · ghproxy</option><option value="moeyy">GitHub 加速代理 · moeyy</option><option value="gh-proxy">GitHub 加速代理 · gh-proxy</option><option value="__skip__">跳过主题（使用 landscape）</option></select></label>
+        </div>
+        <div class="progress-actions"><button class="button secondary" id="viewProgressLogButton" type="button">查看日志</button><button class="button secondary hidden" id="openThemeFolderButton" type="button">打开 themes 目录</button><button class="button primary hidden" id="repairDependenciesButton" type="button">修复依赖</button><button class="button primary hidden" id="retryAutodeployButton" type="button">重试当前步骤</button><button class="button primary hidden" id="previewAfterDeployButton" type="button">立即本地预览</button><button class="button secondary" id="returnFromProgressButton" type="button">返回主界面</button></div>
+      </footer>
+    </div>
+  </dialog>
+  <script src="{{ url_for('static', filename='vendor/markdown-it/markdown-it.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='vendor/highlight.js/highlight.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='vendor/katex/katex.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='vendor/katex/auto-render.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='vendor/katex/mhchem.min.js') }}"></script>
+
+  <script src="{{ url_for('static', filename='js/config-schema.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

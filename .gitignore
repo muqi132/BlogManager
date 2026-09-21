@@ -1,0 +1,15 @@
+.venv/
+.deps/
+.userdata/
+__pycache__/
+*.py[cod]
+*.log
+config.json
+settings.json
+*.blogmanager.bak
+*.blogmanager.tmp
+.e2e*/
+.testblog/
+dist/
+.DS_Store
+Thumbs.db
