@@ -48,6 +48,7 @@
 - 本地预览：`hexo clean` → `hexo generate` → `hexo server -p <端口>`
 - 一键部署：`hexo clean && hexo deploy`
 - 仅本地自动部署，或配置 GitHub 仓库后发布
+- 自动部署时配置 Butterfly MathJax，支持行内和块级 LaTeX 公式
 
 ## 分发给别人
 
@@ -57,7 +58,7 @@
 python build_release.py
 ```
 
-生成文件位于 `dist/BlogManager-release.zip`。脚本不会打包 `.venv`、`config.json`、`settings.json`、日志、缓存或测试目录。
+生成内容位于 `dist/BlogManager/`，压缩包名为 `dist/BlogManager_v1.0.0_日期.zip`。也可以传入版本号，例如 `python build_release.py 1.1.0`。脚本不会打包 `.venv`、`.git`、`node_modules`、`config.json`、`settings.json`、日志、缓存、临时文件或 `dist` 自身。
 
 也可以直接复制项目中的源码文件，但不要复制 `.venv/`、`.userdata/`、`config.json`、`settings.json` 或任何本机日志。
 

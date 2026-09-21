@@ -29,6 +29,7 @@ from urllib.request import Request, urlopen
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
+from ruamel.yaml.scalarstring import LiteralScalarString, SingleQuotedScalarString
 from werkzeug.exceptions import HTTPException
 
 
@@ -365,18 +366,307 @@ def get_path(document: Mapping[str, Any], path: str, default: Any = None) -> Any
     return current
 
 
-def set_path(document: CommentedMap, path: str, value: Any) -> None:
+def _base_positions(base: Any) -> dict[str, int]:
+    if not isinstance(base, Mapping):
+        return {}
+    return {str(key): index for index, key in enumerate(base.keys())}
+
+
+def _take_comment(mapping: CommentedMap, key: str, index: int) -> Any:
+    entry = mapping.ca.items.get(key)
+    if not entry or index >= len(entry) or entry[index] is None:
+        return None
+    value = entry[index]
+    entry[index] = None
+    return value
+
+
+def _set_comment(mapping: CommentedMap, key: str, index: int, value: Any) -> None:
+    if value is None:
+        return
+    entry = mapping.ca.items.get(key)
+    if entry is None:
+        entry = [None, None, None, None]
+        mapping.ca.items[key] = entry
+    while len(entry) < 4:
+        entry.append(None)
+    entry[index] = value
+
+
+def _insert_mapping_key(mapping: CommentedMap, key: str, value: Any, base: Any = None) -> None:
+    if key in mapping:
+        mapping[key] = copy.deepcopy(value)
+        return
+    keys = list(mapping.keys())
+    index = len(keys)
+    base_positions = _base_positions(base)
+    if key in base_positions:
+        current_position = base_positions[key]
+        following = [
+            item
+            for item in keys
+            if item in base_positions and base_positions[item] > current_position
+        ]
+        if following:
+            index = keys.index(following[0])
+    previous_key = keys[index - 1] if index > 0 else None
+    post_comment = _take_comment(mapping, previous_key, 2) if previous_key is not None else None
+    inserted = value if isinstance(value, (CommentedMap, CommentedSeq)) else copy.deepcopy(value)
+    mapping.insert(index, key, inserted)
+    if post_comment is not None:
+        _set_comment(mapping, key, 2, post_comment)
+
+
+def _coerce_config_value(value: Any, type_hint: str | None = None, base_value: Any = None) -> Any:
+    kind = str(type_hint or "").strip().lower()
+    if kind == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        normalized = str(value).strip().lower()
+        if normalized in {"", "0", "false", "no", "off", "否", "关闭"}:
+            return False
+        if normalized in {"1", "true", "yes", "on", "是", "开启"}:
+            return True
+        raise ApiError(f"布尔配置值格式不正确：{value}")
+    if kind == "number":
+        if value in (None, ""):
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return value
+        number_text = str(value).strip()
+        try:
+            if re.fullmatch(r"[-+]?\d+", number_text):
+                return int(number_text)
+            return float(number_text)
+        except ValueError as exc:
+            raise ApiError(f"数字配置值格式不正确：{value}") from exc
+    if kind in {"array", "list"}:
+        if isinstance(value, list):
+            return CommentedSeq(plain_value(item) for item in value)
+        if value in (None, ""):
+            return CommentedSeq()
+        return CommentedSeq(
+            item.strip() for item in re.split(r"[\n,，]+", str(value)) if item.strip()
+        )
+    if kind in {"yaml", "object", "map"}:
+        if kind in {"object", "map"} and isinstance(value, Mapping):
+            return _comment_map(plain_value(value))
+        if kind in {"object", "map"} and isinstance(value, str):
+            try:
+                parsed = YAML(typ="safe").load(value)
+            except Exception as exc:
+                raise ApiError(f"YAML 对象解析失败：{exc}") from exc
+            if parsed is None:
+                return CommentedMap()
+            if not isinstance(parsed, Mapping):
+                raise ApiError("对象类型配置必须是 YAML 映射。")
+            return _comment_map(plain_value(parsed))
+        if kind == "yaml":
+            if isinstance(value, str):
+                try:
+                    parsed = YAML(typ="safe").load(value)
+                except Exception as exc:
+                    raise ApiError(f"YAML 配置解析失败：{exc}") from exc
+                return _comment_value(parsed)
+            return _comment_value(value)
+    if isinstance(base_value, bool) and isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "false"}:
+            return normalized == "true"
+    if isinstance(base_value, int) and not isinstance(base_value, bool) and isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            pass
+    if isinstance(base_value, float) and isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            pass
+    return value
+
+
+def _comment_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return _comment_map(plain_value(value))
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return CommentedSeq(_comment_value(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _comment_map(value: Mapping[str, Any]) -> CommentedMap:
+    result = CommentedMap()
+    for key, item in value.items():
+        result[str(key)] = _comment_value(item)
+    return result
+
+
+def set_path(
+    document: CommentedMap,
+    path: str,
+    value: Any,
+    base_document: Mapping[str, Any] | None = None,
+) -> None:
     parts = [part for part in path.split(".") if part]
     if not parts:
         raise ApiError("配置路径不能为空。")
-    current = document
+    current: CommentedMap = document
+    base_current: Any = base_document
     for part in parts[:-1]:
         child = current.get(part)
-        if not isinstance(child, Mapping):
+        base_child = base_current.get(part) if isinstance(base_current, Mapping) else None
+        if not isinstance(child, CommentedMap):
             child = CommentedMap()
-            current[part] = child
+            _insert_mapping_key(current, part, child, base_current)
         current = child
-    current[parts[-1]] = value
+        base_current = base_child
+    _insert_mapping_key(current, parts[-1], value, base_current)
+
+
+def _comment_text(value: Any) -> str:
+    if value is None:
+        return ""
+    raw = getattr(value, "value", None)
+    if raw is None:
+        raw = str(value)
+    lines = []
+    for line in str(raw).strip().splitlines():
+        cleaned = line.strip()
+        if cleaned.startswith("#"):
+            cleaned = cleaned[1:].lstrip()
+        if cleaned:
+            lines.append(cleaned)
+    return "\n".join(lines)
+
+
+def delete_path(document: CommentedMap, path: str) -> bool:
+    parts = [part for part in path.split(".") if part]
+    if not parts:
+        return False
+
+    frames: list[tuple[CommentedMap, str]] = []
+    current: Any = document
+    for part in parts[:-1]:
+        if not isinstance(current, Mapping) or part not in current:
+            return False
+        if isinstance(current, CommentedMap):
+            frames.append((current, part))
+        current = current[part]
+
+    if not isinstance(current, CommentedMap) or parts[-1] not in current:
+        return False
+
+    mapping = current
+    key = parts[-1]
+    index = list(mapping.keys()).index(key)
+    comments = [
+        _take_comment(mapping, key, 0),
+        _take_comment(mapping, key, 1),
+        _take_comment(mapping, key, 2),
+    ]
+    mapping.pop(key, None)
+
+    while True:
+        remaining = list(mapping.keys())
+        if remaining:
+            comment_text = "\n".join(text for text in (_comment_text(item) for item in comments) if text)
+            if comment_text:
+                if index < len(remaining):
+                    mapping.yaml_set_comment_before_after_key(remaining[index], before=comment_text)
+                else:
+                    mapping.yaml_set_comment_before_after_key(remaining[index - 1], after=comment_text)
+            return True
+
+        if not frames:
+            return True
+
+        parent_mapping, parent_key = frames.pop()
+        parent_index = list(parent_mapping.keys()).index(parent_key)
+        parent_comments = [
+            _take_comment(parent_mapping, parent_key, 0),
+            _take_comment(parent_mapping, parent_key, 1),
+            _take_comment(parent_mapping, parent_key, 2),
+        ]
+        parent_mapping.pop(parent_key, None)
+        mapping = parent_mapping
+        index = parent_index
+        comments = parent_comments + comments
+
+
+def collect_explicit_paths(document: Any, prefix: str = "") -> set[str]:
+    paths: set[str] = set()
+    if isinstance(document, Mapping):
+        if not document and prefix:
+            paths.add(prefix)
+            return paths
+        for key, value in document.items():
+            key_text = str(key)
+            if "." in key_text:
+                continue
+            path = f"{prefix}.{key_text}" if prefix else key_text
+            if isinstance(value, Mapping):
+                paths.update(collect_explicit_paths(value, path))
+            else:
+                paths.add(path)
+    elif prefix:
+        paths.add(prefix)
+    return paths
+
+
+def apply_config_changes(
+    document: CommentedMap,
+    changes: Any,
+    base_document: Mapping[str, Any] | None = None,
+    reset_paths: Any = None,
+) -> int:
+    if changes is None:
+        changes = {}
+    if not isinstance(changes, Mapping):
+        raise ApiError("changes 必须是 JSON 对象。")
+    if reset_paths is not None and not isinstance(reset_paths, list):
+        raise ApiError("reset_paths 必须是数组。")
+    reset_values: list[str] = []
+    seen_reset: set[str] = set()
+    for item in reset_paths or []:
+        path = str(item).strip()
+        if path and path not in seen_reset:
+            seen_reset.add(path)
+            reset_values.append(path)
+    changed = 0
+    for path in reset_values:
+        changed += int(delete_path(document, path))
+    for path, change in changes.items():
+        path_text = str(path).strip()
+        if not path_text:
+            continue
+        if isinstance(change, Mapping) and "value" in change:
+            raw_value = change.get("value")
+            type_hint = str(change.get("type", "") or "")
+        else:
+            raw_value = change
+            type_hint = ""
+        normalized_type = type_hint.strip().lower()
+        if normalized_type == "number" and raw_value in (None, ""):
+            if path_text not in seen_reset:
+                seen_reset.add(path_text)
+                changed += int(delete_path(document, path_text))
+            continue
+        if normalized_type in {"yaml", "object", "map"} and raw_value in (None, ""):
+            if path_text not in seen_reset:
+                seen_reset.add(path_text)
+                changed += int(delete_path(document, path_text))
+            continue
+        base_value = get_path(base_document, path_text) if isinstance(base_document, Mapping) else None
+        typed_value = _coerce_config_value(raw_value, type_hint, base_value)
+        set_path(document, path_text, typed_value, base_document)
+        changed += 1
+    return changed
 
 
 def dump_yaml_value(value: Any) -> str:
@@ -1554,17 +1844,24 @@ def api_update_site_config() -> Response:
     mode = payload.get("mode", "fields")
     if mode == "raw":
         document = load_yaml_text(str(payload.get("raw_yaml", "")), "站点配置")
-    elif mode == "fields":
-        values = payload.get("values")
-        if not isinstance(values, dict):
-            raise ApiError("values 必须是 JSON 对象。")
-        document = load_yaml_file(path)
-        for key, value in values.items():
-            set_path(document, str(key), value)
-    else:
+        backup = write_yaml_file(path, document)
+        return jsonify({"ok": True, "path": str(path), "backup": str(backup), "changed": 1})
+    if mode != "fields":
         raise ApiError("mode 必须为 fields 或 raw。")
-    backup = write_yaml_file(path, document)
-    return jsonify({"ok": True, "path": str(path), "backup": str(backup)})
+    changes = payload.get("changes", {})
+    document = load_yaml_file(path)
+    changed = apply_config_changes(document, changes, None, payload.get("reset_paths", []))
+    backup = None
+    if changed:
+        backup = write_yaml_file(path, document)
+    return jsonify(
+        {
+            "ok": True,
+            "path": str(path),
+            "backup": str(backup) if backup else "",
+            "changed": changed,
+        }
+    )
 
 
 def load_effective_theme_document() -> tuple[CommentedMap, Path, Path]:
@@ -1582,6 +1879,8 @@ def api_get_theme_config() -> Response:
     effective, base_path, override_path = load_effective_theme_document()
     if not base_path.exists() and not override_path.exists():
         raise ApiError("找不到 Butterfly 主题配置文件。", 404)
+    base = load_yaml_file(base_path, allow_missing=True)
+    override = load_yaml_file(override_path, allow_missing=True)
     menu = get_path(effective, "menu", CommentedMap())
     social = get_path(effective, "social", CommentedMap())
     if not isinstance(menu, Mapping):
@@ -1596,7 +1895,11 @@ def api_get_theme_config() -> Response:
             "override_path": str(override_path),
             "raw_target": "override",
             "values": plain_value(effective),
-            "raw_yaml": dump_yaml_value(effective),
+            "base_values": plain_value(base),
+            "override_values": plain_value(override),
+            "override_paths": sorted(collect_explicit_paths(override)),
+            "raw_yaml": dump_yaml_value(override),
+            "effective_raw_yaml": dump_yaml_value(effective),
             "menu_items": menu_items,
             "menu_is_simple": menu_is_simple,
             "social_items": social_items,
@@ -1611,26 +1914,47 @@ def api_update_theme_config() -> Response:
     mode = payload.get("mode", "fields")
     base_path, override_path = theme_config_paths()
     if mode == "raw":
-        target = payload.get("raw_target", "override")
-        target_path = override_path if target == "override" else base_path
         document = load_yaml_text(str(payload.get("raw_yaml", "")), "主题配置")
-        backup = write_yaml_file(target_path, document)
-        return jsonify({"ok": True, "path": str(target_path), "backup": str(backup)})
+        backup = write_yaml_file(override_path, document)
+        return jsonify(
+            {
+                "ok": True,
+                "path": str(override_path),
+                "backup": str(backup),
+                "changed": 1,
+            }
+        )
 
     if mode != "fields":
         raise ApiError("mode 必须为 fields 或 raw。")
-    values = payload.get("values", {})
-    if not isinstance(values, dict):
-        raise ApiError("values 必须是 JSON 对象。")
+    base = load_yaml_file(base_path, allow_missing=True)
     override = load_yaml_file(override_path, allow_missing=True)
-    for key, value in values.items():
-        set_path(override, str(key), value)
+    changes = copy.deepcopy(payload.get("changes", {}))
+    if not isinstance(changes, Mapping):
+        raise ApiError("changes 必须是 JSON 对象。")
+    changes = dict(changes)
     if "menu_items" in payload:
-        override["menu"] = build_menu_mapping(payload.get("menu_items", []))
+        changes["menu"] = {"type": "yaml", "value": build_menu_mapping(payload.get("menu_items", []))}
     if "social_items" in payload:
-        override["social"] = build_social_mapping(payload.get("social_items", []))
-    backup = write_yaml_file(override_path, override)
-    return jsonify({"ok": True, "path": str(override_path), "backup": str(backup)})
+        changes["social"] = {"type": "yaml", "value": build_social_mapping(payload.get("social_items", []))}
+    changed = apply_config_changes(
+        override,
+        changes,
+        base,
+        payload.get("reset_paths", []),
+    )
+    backup = None
+    if changed:
+        backup = write_yaml_file(override_path, override)
+    return jsonify(
+        {
+            "ok": True,
+            "path": str(override_path),
+            "backup": str(backup) if backup else "",
+            "changed": changed,
+        }
+    )
+
 
 def target_theme_name(target: Path) -> str:
     try:
@@ -2188,11 +2512,16 @@ def api_delete_post() -> Response:
     return jsonify({"ok": True, "moved_to": target.relative_to(root).as_posix()})
 
 
-def safe_image_filename(filename: str) -> str:
+def safe_image_filename(
+    filename: str,
+    allowed_extensions: set[str] | None = None,
+) -> str:
+    allowed = allowed_extensions or COVER_IMAGE_EXTENSIONS
     raw = Path(str(filename or "")).name
     suffix = Path(raw).suffix.lower()
-    if suffix not in COVER_IMAGE_EXTENSIONS:
-        raise ApiError("只支持 JPG、JPEG、PNG、WEBP 和 GIF 图片。")
+    if suffix not in allowed:
+        labels = "、".join(sorted(item.lstrip(".").upper() for item in allowed))
+        raise ApiError(f"只支持 {labels} 图片。")
     stem = re.sub(r'[\\/:*?"<>|]+', "-", Path(raw).stem).strip(" .") or "cover"
     return f"{stem}{suffix}"
 
@@ -2227,7 +2556,10 @@ def image_payload(path: Path, root: Path) -> dict[str, Any]:
 def api_images() -> Response:
     root = require_blog_directory() / "source" / "img"
     images = [image_payload(path, root) for path in list_files(root, IMAGE_EXTENSIONS)]
-    images.sort(key=lambda item: item["modified"], reverse=True)
+    if request.args.get("sort") == "name":
+        images.sort(key=lambda item: item["name"].casefold())
+    else:
+        images.sort(key=lambda item: item["modified"], reverse=True)
     return jsonify({"path": str(root), "images": images})
 
 
@@ -2238,7 +2570,9 @@ def api_upload_image() -> Response:
     upload = request.files.get("file")
     if upload is None or not upload.filename:
         raise ApiError("请选择要上传的图片文件。")
-    filename = safe_image_filename(upload.filename)
+    scope = str(request.form.get("scope", "cover") or "cover").strip().lower()
+    allowed_extensions = IMAGE_EXTENSIONS if scope in {"config", "all"} else COVER_IMAGE_EXTENSIONS
+    filename = safe_image_filename(upload.filename, allowed_extensions)
     target = unique_image_target(root, filename)
     try:
         upload.save(target)
@@ -2267,22 +2601,30 @@ def api_image_from_url() -> Response:
         ) from exc
     if len(data) > 25 * 1024 * 1024:
         raise ApiError("图片超过 25 MB，建议压缩后再上传。", 413, {"url": url, "download_failed": True})
+    scope = str(payload.get("scope", "cover") or "cover").strip().lower()
+    allowed_extensions = IMAGE_EXTENSIONS if scope in {"config", "all"} else COVER_IMAGE_EXTENSIONS
     mime_suffixes = {
         "image/jpeg": ".jpg",
         "image/png": ".png",
         "image/webp": ".webp",
         "image/gif": ".gif",
+        "image/svg+xml": ".svg",
+        "image/bmp": ".bmp",
+        "image/avif": ".avif",
+        "image/x-icon": ".ico",
+        "image/vnd.microsoft.icon": ".ico",
     }
     suffix = Path(parsed.path).suffix.lower()
-    if suffix not in COVER_IMAGE_EXTENSIONS:
+    if suffix not in allowed_extensions:
         suffix = mime_suffixes.get(content_type, "")
-    if suffix not in COVER_IMAGE_EXTENSIONS:
+    if suffix not in allowed_extensions:
+        labels = "、".join(sorted(item.lstrip(".").upper() for item in allowed_extensions))
         raise ApiError(
-            "无法确认图片格式，仅支持 JPG、JPEG、PNG、WEBP 和 GIF。",
+            f"无法确认图片格式，仅支持 {labels}。",
             415,
             {"url": url, "download_failed": True},
         )
-    filename = safe_image_filename(f"{Path(parsed.path).stem or 'cover'}{suffix}")
+    filename = safe_image_filename(f"{Path(parsed.path).stem or 'cover'}{suffix}", allowed_extensions)
     root = require_blog_directory() / "source" / "img"
     root.mkdir(parents=True, exist_ok=True)
     target = unique_image_target(root, filename)
@@ -2760,6 +3102,126 @@ def apply_autodeploy_config(target: Path, options: dict[str, Any], task: Task) -
         task.emit(f"主题配置复制失败：{exc}；将保留主题默认配置。", "warning")
 
 
+def remove_conflicting_mathjax_plugin(target: Path, task: Task) -> None:
+    package_path = target / "package.json"
+    if package_path.exists():
+        try:
+            package_data = json.loads(package_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            task.emit(f"读取 package.json 失败，无法自动清理 hexo-filter-mathjax：{exc}", "warning")
+            package_data = None
+        if isinstance(package_data, dict):
+            removed = False
+            for section in ("dependencies", "devDependencies"):
+                dependencies = package_data.get(section)
+                if isinstance(dependencies, dict) and "hexo-filter-mathjax" in dependencies:
+                    dependencies.pop("hexo-filter-mathjax", None)
+                    removed = True
+            if removed:
+                package_path.write_text(
+                    json.dumps(package_data, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                task.emit("已从 package.json 移除冲突插件 hexo-filter-mathjax。", "success")
+
+    module_path = ensure_child_path(target / "node_modules", "hexo-filter-mathjax")
+    if module_path.exists():
+        try:
+            shutil.rmtree(module_path)
+        except OSError as exc:
+            raise AutodeployError(f"无法移除冲突插件目录 hexo-filter-mathjax：{exc}") from exc
+        task.emit("已移除 node_modules/hexo-filter-mathjax。", "success")
+
+
+def merge_latex_inject(override: CommentedMap, base: CommentedMap) -> int:
+    base_inject = base.get("inject") if isinstance(base.get("inject"), Mapping) else None
+    inject = override.get("inject")
+    if inject is None:
+        inject = CommentedMap()
+        _insert_mapping_key(override, "inject", inject, base)
+    elif not isinstance(inject, CommentedMap):
+        if not isinstance(inject, Mapping):
+            raise AutodeployError("根目录 _config.butterfly.yml 中的 inject 不是映射，无法安全合并。")
+        new_inject = _comment_map(plain_value(inject))
+        _insert_mapping_key(override, "inject", new_inject, base)
+        inject = new_inject
+
+    base_head = base_inject.get("head") if isinstance(base_inject, Mapping) else None
+    head = inject.get("head")
+    if head is None:
+        inherited_head = base_head if isinstance(base_head, (list, tuple)) else []
+        head = CommentedSeq(copy.deepcopy(inherited_head))
+        _insert_mapping_key(inject, "head", head, base_inject)
+    elif not isinstance(head, CommentedSeq):
+        if not isinstance(head, Sequence) or isinstance(head, (str, bytes, bytearray)):
+            raise AutodeployError("根目录 _config.butterfly.yml 中的 inject.head 不是数组，无法安全合并。")
+        new_head = CommentedSeq(head)
+        _insert_mapping_key(inject, "head", new_head, base_inject)
+        head = new_head
+
+    script_config = LiteralScalarString(r"""<script>
+MathJax = {
+  tex: {
+    inlineMath: [['$', '$'], ['\\(', '\\)']],
+    displayMath: [['$$', '$$'], ['\\[', '\\]']],
+    processEscapes: true
+  },
+  svg: {
+    fontCache: 'global'
+  }
+};
+</script>""")
+    script_url = SingleQuotedScalarString(
+        '<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>'
+    )
+    style = LiteralScalarString(r"""<style>
+mjx-container[display="false"] {
+  overflow: hidden !important;
+}
+</style>""")
+    additions = (
+        ("MathJax = {", script_config),
+        ("mathjax@3/es5/tex-mml-chtml.js", script_url),
+        ('mjx-container[display="false"]', style),
+    )
+    existing = "\n".join(str(item) for item in head)
+    added = 0
+    for marker, value in additions:
+        if marker in existing:
+            continue
+        head.append(copy.deepcopy(value))
+        existing += "\n" + str(value)
+        added += 1
+    return added
+
+
+def configure_latex_rendering(target: Path, task: Task) -> None:
+    task.emit("正在配置 Butterfly MathJax 与冲突插件清理...", "system")
+    remove_conflicting_mathjax_plugin(target, task)
+
+    base_path = target / "themes" / "butterfly" / "_config.yml"
+    override_path = target / THEME_CONFIG_NAME
+    base = load_yaml_file(base_path, allow_missing=True)
+    override = load_yaml_file(override_path, allow_missing=True)
+    changes = {
+        "math.use": {"type": "text", "value": "mathjax"},
+        "math.per_page": {"type": "boolean", "value": False},
+        "math.hide_scrollbar": {"type": "boolean", "value": False},
+        "math.mathjax.enableMenu": {"type": "boolean", "value": True},
+        "math.mathjax.tags": {"type": "text", "value": "none"},
+    }
+    changed = apply_config_changes(override, changes, base, [])
+    changed += merge_latex_inject(override, base)
+    if changed:
+        write_yaml_file(override_path, override)
+    task.emit("已启用 Butterfly 内置 MathJax，并合并 inject.head 注入内容。", "success")
+    task.emit(
+        "MathJax 默认使用 jsDelivr CDN；若本地预览或线上公式未显示，请检查网络，"
+        "更换 CDN 地址，或手动下载 MathJax 到本地 source/ 后修改注入脚本。",
+        "warning",
+    )
+
+
 def theme_source_candidates(theme_repo: str) -> list[dict[str, str]]:
     candidates: list[dict[str, str]] = []
     preferred = (theme_repo or "").strip()
@@ -2856,6 +3318,7 @@ def autodeploy_step_definitions(options: dict[str, Any]) -> list[dict[str, str]]
     steps.extend(
         [
             {"id": "config", "title": "应用站点配置"},
+            {"id": "latex", "title": "配置 LaTeX 渲染"},
             {"id": "deps", "title": "安装依赖"},
             {"id": "deps-check", "title": "检查主题渲染依赖"},
             {"id": "welcome", "title": "添加欢迎文章"},
@@ -3105,6 +3568,16 @@ def run_autodeploy(task: Task, options: dict[str, Any]) -> None:
             apply_autodeploy_config(target, options, task)
             task.emit_step(current_step, "success")
 
+        if step_enabled("latex"):
+            current_step = "latex"
+            task.emit_step(current_step, "running")
+            if options.get("skip_theme"):
+                task.emit("使用 landscape 主题，跳过 Butterfly MathJax 配置。", "warning")
+                task.emit_step(current_step, "success", "已跳过 Butterfly 主题")
+            else:
+                configure_latex_rendering(target, task)
+                task.emit_step(current_step, "success", "MathJax 配置已写入根目录 _config.butterfly.yml")
+
         if step_enabled("deps"):
             current_step = "deps"
             task.emit_step(current_step, "running")
@@ -3126,6 +3599,8 @@ def run_autodeploy(task: Task, options: dict[str, Any]) -> None:
                 task.emit("渲染器安装命令失败，但当前渲染器依赖完整，继续使用已安装版本。", "warning")
             else:
                 task.emit("已安装渲染器：hexo-renderer-pug, hexo-renderer-stylus", "success")
+            if not options.get("skip_theme"):
+                remove_conflicting_mathjax_plugin(target, task)
             task.emit_step(current_step, "success", "项目依赖和 Butterfly 渲染器已安装")
 
         if step_enabled("deps-check"):
@@ -3617,7 +4092,7 @@ def picker_subprocess_main(initial_dir: str) -> int:
     return 0
 
 def find_free_port(preferred: int = 5000) -> int:
-    for port in (preferred, 0):
+    for port in [*range(preferred, min(preferred + 20, 65536)), 0]:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             try:
                 sock.bind(("127.0.0.1", port))
@@ -3648,6 +4123,19 @@ def find_browser() -> Path | None:
         if candidate.is_file():
             return candidate
     return None
+
+
+def open_app_window_when_ready(url: str, timeout: float = 20.0) -> None:
+    deadline = time.time() + timeout
+    health_url = f"{url.rstrip('/')}/api/status"
+    while time.time() < deadline:
+        try:
+            with urlopen(health_url, timeout=0.8) as response:
+                if response.status < 500:
+                    break
+        except (URLError, TimeoutError, OSError, ValueError):
+            time.sleep(0.25)
+    open_app_window(url)
 
 
 def open_app_window(url: str) -> None:
@@ -3700,7 +4188,7 @@ def main() -> int:
     port = find_free_port(args.port)
     url = f"http://127.0.0.1:{port}"
     if not args.no_browser:
-        threading.Timer(0.8, open_app_window, args=(url,)).start()
+        threading.Thread(target=open_app_window_when_ready, args=(url,), daemon=True).start()
         threading.Thread(target=start_client_watchdog, daemon=True).start()
     try:
         app.run(host="127.0.0.1", port=port, threaded=True, use_reloader=False, debug=False)

@@ -128,7 +128,7 @@
               <h1>站点配置</h1>
               <p>覆盖 Hexo 的常用站点、写作、分页和部署配置；复杂字段可切换到完整 YAML 模式。</p>
             </div>
-            <div class="heading-actions"><span class="file-chip">_config.yml</span><span class="save-state" id="siteSaveHint">等待加载配置</span><div class="segmented" id="siteModeSwitch" role="group" aria-label="站点配置编辑模式"><button type="button" class="active" data-mode="fields">表单</button><button type="button" data-mode="raw">YAML</button></div><button class="button primary" type="submit" form="siteForm" id="saveSiteButton"><svg><use href="#i-save"></use></svg><span>保存站点配置</span></button></div>
+            <div class="heading-actions"><span class="file-chip">_config.yml</span><span class="save-state" id="siteSaveHint">等待加载配置</span><label class="config-search"><svg><use href="#i-search"></use></svg><input type="search" id="siteConfigSearch" placeholder="搜索站点配置"></label><div class="segmented" id="siteModeSwitch" role="group" aria-label="站点配置编辑模式"><button type="button" class="active" data-mode="fields">表单</button><button type="button" data-mode="raw">YAML</button></div><button class="button primary" type="submit" form="siteForm" id="saveSiteButton"><svg><use href="#i-save"></use></svg><span>保存站点配置</span></button></div>
           </div>
           <div class="notice warning hidden" id="siteConfigNotice"><svg><use href="#i-folder"></use></svg><div><strong>未找到 _config.yml</strong><span>请确认当前文件夹是 Hexo 博客根目录，然后重新选择。</span></div></div>
           <form id="siteForm">
@@ -149,7 +149,7 @@
               <h1>主题配置</h1>
               <p>合并读取主题完整配置和根目录覆盖文件，常用字段可视化编辑，完整内容可使用 YAML 模式。</p>
             </div>
-            <div class="heading-actions"><span class="file-chip">_config.butterfly.yml</span><span class="save-state" id="themeSaveHint">等待加载配置</span><div class="segmented" id="themeModeSwitch" role="group" aria-label="主题配置编辑模式"><button type="button" class="active" data-mode="fields">表单</button><button type="button" data-mode="raw">YAML</button></div><button class="button primary" type="submit" form="themeForm" id="saveThemeButton"><svg><use href="#i-save"></use></svg><span>保存主题配置</span></button></div>
+            <div class="heading-actions"><span class="file-chip">_config.butterfly.yml</span><span class="save-state" id="themeSaveHint">等待加载配置</span><label class="config-search"><svg><use href="#i-search"></use></svg><input type="search" id="themeConfigSearch" placeholder="搜索主题配置"></label><div class="segmented" id="themeModeSwitch" role="group" aria-label="主题配置编辑模式"><button type="button" class="active" data-mode="fields">表单</button><button type="button" data-mode="raw">YAML</button></div><button class="button primary" type="submit" form="themeForm" id="saveThemeButton"><svg><use href="#i-save"></use></svg><span>保存主题配置</span></button></div>
           </div>
           <div class="notice warning hidden" id="themeConfigNotice"><svg><use href="#i-folder"></use></svg><div><strong>未找到 Butterfly 配置</strong><span>未发现主题目录配置文件或根目录覆盖文件。</span></div></div>
           <div class="notice info source-notice" id="themeSourceNotice"><svg><use href="#i-code"></use></svg><div><strong>配置合并来源</strong><span id="themeSourceText">正在读取...</span></div></div>
@@ -181,7 +181,7 @@
             </div>
 
             <div class="raw-editor hidden" id="themeRawEditor">
-              <div class="editor-bar"><span>完整有效主题配置 → 保存到 _config.butterfly.yml</span><span>YAML · UTF-8</span></div>
+              <div class="editor-bar"><span>根目录覆盖 YAML · 保存到 _config.butterfly.yml</span><span>YAML · UTF-8</span></div>
               <textarea id="themeRawYaml" spellcheck="false" aria-label="主题完整 YAML"></textarea>
             </div>
 
@@ -369,6 +369,15 @@
     <input class="hidden" type="file" id="coverFileInput" accept=".jpg,.jpeg,.png,.webp,.gif">
   </dialog>
 
+  <dialog class="cover-dialog" id="configImageDialog">
+    <header class="cover-header"><div><span class="eyebrow">IMAGE LIBRARY</span><h2>选择图片</h2><p id="configImagePath">配置路径</p></div><button class="icon-button" id="closeConfigImageButton" type="button" aria-label="关闭图片选择器"><svg><use href="#i-x"></use></svg></button></header>
+    <div class="cover-current"><div class="cover-preview"><img id="configImagePreviewImage" alt="当前图片"><span id="configImagePreviewEmpty"><svg><use href="#i-image"></use></svg>未设置图片</span></div><div class="cover-current-copy"><span>将写入的路径</span><code id="configImageCurrentValue">未设置</code><small id="configImageExternalHint"></small></div></div>
+    <div class="cover-library-heading"><strong>source/img 图片库</strong><span>按文件名升序，点击图片选择或取消</span></div>
+    <div class="cover-library" id="configImageLibrary"></div>
+    <footer class="cover-footer"><span></span><div class="cover-footer-actions"><button class="button secondary" id="addConfigImageUrlButton" type="button"><svg><use href="#i-link"></use></svg><span>从 URL 添加图片</span></button><button class="button secondary" id="uploadConfigImageButton" type="button"><svg><use href="#i-upload"></use></svg><span>上传本地图片</span></button><button class="button secondary" id="cancelConfigImageButton" type="button">取消</button><button class="button primary" id="confirmConfigImageButton" type="button"><svg><use href="#i-check"></use></svg><span>确认</span></button></div></footer>
+    <input class="hidden" type="file" id="configImageFileInput" accept=".ico,.png,.jpg,.jpeg,.svg,.webp,.gif,.bmp,.avif">
+  </dialog>
+
   <dialog class="app-dialog autodeploy-dialog" id="autodeployDialog">
     <form method="dialog" id="autodeployForm">
       <div class="dialog-heading-row"><div class="dialog-icon"><svg><use href="#i-cubes"></use></svg></div><div><h2>自动部署 Hexo + Butterfly</h2><p>从空文件夹创建完整博客，或更新已有 Hexo 项目。</p></div></div>
@@ -393,7 +402,7 @@
       <label class="check-row"><input type="checkbox" id="autoDeployOverwrite"><span>已有 Hexo 项目时覆盖站点配置和主题覆盖配置</span></label>
       <label class="check-row"><input type="checkbox" id="autoDeployCopyContent"><span>同时复制当前博客的文章和图片</span></label>
       <label class="check-row"><input type="checkbox" id="autoDeployLocalOnly"><span>仅本地创建（不配置远程仓库，完成后只提供本地预览）</span></label>
-      <div class="notice info autodeploy-notice" id="autoDeployNotice"><svg><use href="#i-info"></use></svg><div><strong>执行内容</strong><span>初始化 Hexo → 克隆 Butterfly → npm install → 安装并检查渲染器 → 应用配置 → hexo generate。全过程将在独立进度页实时显示。</span></div></div>
+      <div class="notice info autodeploy-notice" id="autoDeployNotice"><svg><use href="#i-info"></use></svg><div><strong>执行内容</strong><span>初始化 Hexo → 克隆 Butterfly → 应用配置 → 配置 LaTeX 渲染 → npm install → 安装并检查渲染器 → hexo generate。全过程将在独立进度页实时显示。</span></div></div>
       <div class="dialog-actions"><button class="button secondary" id="closeAutoDeployDialog" type="button">取消</button><button class="button primary" id="startAutoDeployButton" type="button">开始自动部署</button></div>
     </form>
   </dialog>

@@ -43,17 +43,40 @@ const state = {
   images: [],
   imageViewer: { relativePath: "", name: "", url: "", size: 0, width: 0, height: 0, scale: 1, rotation: 0, x: 0, y: 0, dragging: false, startX: 0, startY: 0, originX: 0, originY: 0 },
   editor: { relativePath: "", content: "", original: "", dirty: false, renderTimer: null },
-  site: { loaded: false, dirty: false, mode: "fields", values: {}, groups: SCHEMA.siteGroups },
+  configImage: { kind: "", path: "", selected: "", external: "", images: [], newImages: new Set(), loadToken: 0 },
+  site: {
+    loaded: false,
+    dirty: false,
+    mode: "fields",
+    values: {},
+    baseValues: {},
+    overridePaths: new Set(),
+    dirtyPaths: new Set(),
+    resetPaths: new Set(),
+    fieldMap: new Map(),
+    groups: SCHEMA.siteGroups,
+    searchTerm: "",
+  },
   theme: {
     loaded: false,
     dirty: false,
     mode: "fields",
     values: {},
+    baseValues: {},
+    overridePaths: new Set(),
+    dirtyPaths: new Set(),
+    resetPaths: new Set(),
+    fieldMap: new Map(),
     groups: SCHEMA.themeGroups,
     menuItems: [],
     menuSimple: true,
+    menuOriginal: [],
+    menuDirty: false,
     socialItems: [],
     socialSimple: true,
+    socialOriginal: [],
+    socialDirty: false,
+    searchTerm: "",
   },
 };
 
@@ -160,17 +183,141 @@ function activateSection(name) {
 }
 
 function markDirty(kind) {
-  state[kind].dirty = true;
+  const config = state[kind];
+  const specialDirty = kind === "theme" && (state.theme.menuDirty || state.theme.socialDirty);
+  config.dirty = config.dirtyPaths.size > 0 || config.resetPaths.size > 0 || specialDirty;
   const hint = kind === "site" ? $("#siteSaveHint") : $("#themeSaveHint");
-  if (hint) { hint.textContent = "有未保存的修改"; hint.className = "save-state dirty"; }
+  if (hint) {
+    hint.textContent = config.dirty ? "有未保存的修改" : "配置已加载";
+    hint.className = `save-state ${config.dirty ? "dirty" : ""}`.trim();
+  }
 }
 
 function clearDirty(kind) {
   state[kind].dirty = false;
+  state[kind].dirtyPaths.clear();
+  state[kind].resetPaths.clear();
+  if (kind === "theme") {
+    state.theme.menuDirty = false;
+    state.theme.socialDirty = false;
+  }
 }
 
 function hasUnsavedChanges() {
   return state.site.dirty || state.theme.dirty;
+}
+
+function cloneValue(value) {
+  if (value === undefined) return undefined;
+  return JSON.parse(JSON.stringify(value));
+}
+
+function valuesEqual(left, right) {
+  if (left === right) return true;
+  if (left === undefined || right === undefined) return false;
+  try { return JSON.stringify(left) === JSON.stringify(right); }
+  catch (_error) { return false; }
+}
+
+function humanizeConfigKey(key) {
+  const known = {
+    url: "URL", cdn: "CDN", pwa: "PWA", seo: "SEO", id: "ID", css: "CSS", js: "JS",
+    mathjax: "MathJax", open_graph: "Open Graph", structured_data: "结构化数据",
+  };
+  if (known[key]) return known[key];
+  return String(key || "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b[a-z]/g, (letter) => letter.toUpperCase());
+}
+
+function isImageConfigPath(path) {
+  const key = String(path || "").split(".").pop() || "";
+  return /^(favicon|.*_?img|image|logo|background)$/i.test(key)
+    && !/(height|width|enable|effect|position|size)$/i.test(key);
+}
+
+function inferConfigType(path, value, baseValue) {
+  const sample = value !== undefined ? value : baseValue;
+  if (typeof sample === "boolean") return "boolean";
+  if (typeof sample === "number") return "number";
+  if (Array.isArray(sample)) {
+    return sample.every((item) => ["string", "number", "boolean"].includes(typeof item)) ? "list" : "yaml";
+  }
+  if (sample && typeof sample === "object") return "yaml";
+  if (isImageConfigPath(path)) return "image";
+  return "text";
+}
+
+function flattenConfigValues(value, prefix, output) {
+  if (Array.isArray(value)) {
+    output.push({ path: prefix, value, type: inferConfigType(prefix, value, undefined) });
+    return;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value);
+    if (!entries.length && prefix) {
+      output.push({ path: prefix, value, type: "yaml" });
+      return;
+    }
+    for (const [key, child] of entries) {
+      if (key.includes(".")) continue;
+      const childPath = prefix ? `${prefix}.${key}` : key;
+      flattenConfigValues(child, childPath, output);
+    }
+    return;
+  }
+  output.push({ path: prefix, value });
+}
+
+function buildDynamicConfigGroups(kind, values) {
+  const config = state[kind];
+  const staticPaths = new Set();
+  config.groups.filter((group) => !group.dynamic).forEach((group) => {
+    group.fields.forEach((field) => staticPaths.add(field.path));
+  });
+  if (kind === "theme") {
+    staticPaths.add("menu");
+    staticPaths.add("social");
+  }
+  const leaves = [];
+  for (const [key, value] of Object.entries(values || {})) {
+    if (kind === "theme" && ["menu", "social"].includes(key)) continue;
+    flattenConfigValues(value, key, leaves);
+  }
+  const grouped = new Map();
+  for (const leaf of leaves) {
+    if (!leaf.path || staticPaths.has(leaf.path)) continue;
+    const top = leaf.path.split(".")[0];
+    if (!grouped.has(top)) grouped.set(top, []);
+    const baseValue = getPath(config.baseValues, leaf.path);
+    const type = inferConfigType(leaf.path, leaf.value, baseValue);
+    grouped.get(top).push({
+      path: leaf.path,
+      label: humanizeConfigKey(leaf.path.split(".").pop()),
+      type,
+      imagePicker: type === "image",
+      hint: "自动扫描的配置项；复杂结构请在完整 YAML 模式中编辑。",
+      default: baseValue,
+    });
+  }
+  return Array.from(grouped.entries()).sort(([a], [b]) => a.localeCompare(b, "zh-CN")).map(([top, fields]) => ({
+    id: `dynamic-${kind}-${top}`,
+    title: `其他配置 · ${humanizeConfigKey(top)}`,
+    description: "由有效 YAML 结构自动扫描生成，未在常用分类中重复显示。",
+    dynamic: true,
+    fields: fields.sort((a, b) => a.path.localeCompare(b.path, "zh-CN")),
+  }));
+}
+
+function rebuildConfigGroups(kind) {
+  const config = state[kind];
+  const staticGroups = kind === "site" ? SCHEMA.siteGroups : SCHEMA.themeGroups;
+  config.groups = [
+    ...staticGroups,
+    ...buildDynamicConfigGroups(kind, config.values),
+  ];
+  config.fieldMap = new Map();
+  config.groups.forEach((group) => group.fields.forEach((field) => config.fieldMap.set(field.path, field)));
 }
 
 function createControl(field, value) {
@@ -189,6 +336,24 @@ function createControl(field, value) {
     track.append(thumb);
     label.append(input, track);
     return label;
+  }
+  if (field.imagePicker || field.type === "image") {
+    const wrap = document.createElement("div");
+    wrap.className = "image-path-control";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "setting-control mono";
+    input.dataset.path = field.path;
+    input.dataset.type = "text";
+    input.value = value == null ? "" : String(value);
+    input.placeholder = field.placeholder || "/img/example.png 或 https://...";
+    const picker = document.createElement("button");
+    picker.type = "button";
+    picker.className = "button secondary image-picker-button";
+    picker.dataset.imagePickerPath = field.path;
+    picker.innerHTML = '<svg><use href="#i-image"></use></svg><span>选择图片</span>';
+    wrap.append(input, picker);
+    return wrap;
   }
   if (field.type === "select" || field.type === "selectOrText") {
     const wrap = document.createElement("div");
@@ -243,6 +408,17 @@ function createControl(field, value) {
     textarea.placeholder = field.placeholder || "每行一项";
     return textarea;
   }
+  if (field.type === "yaml") {
+    const textarea = document.createElement("textarea");
+    textarea.className = "setting-control mono";
+    textarea.rows = 5;
+    textarea.dataset.path = field.path;
+    textarea.dataset.type = "yaml";
+    const safeValue = typeof value === "string" ? value : JSON.stringify(value ?? null, null, 2);
+    textarea.value = safeValue;
+    textarea.placeholder = field.placeholder || "YAML";
+    return textarea;
+  }
   const tag = field.type === "textarea" ? "textarea" : "input";
   const control = document.createElement(tag);
   control.className = `setting-control ${field.mono ? "mono" : ""}`.trim();
@@ -262,12 +438,122 @@ function createControl(field, value) {
   return control;
 }
 
+function formatDefaultValue(value) {
+  if (value === undefined) return "";
+  if (value === null) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (Array.isArray(value)) return value.map((item) => String(item)).join(", ");
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function readConfigPathValue(container, path) {
+  const controls = $$(`[data-path="${CSS.escape(path)}"]`, container);
+  if (!controls.length) return undefined;
+  const visible = controls.filter((control) => !control.classList.contains("hidden"));
+  const custom = visible.find((control) => control.dataset.type === "custom");
+  const select = visible.find((control) => control.dataset.type === "select");
+  if (custom && (!select || select.value === "__custom__")) return custom.value;
+  const control = visible[0] || controls[0];
+  const type = control.dataset.type;
+  if (type === "boolean") return control.checked;
+  if (type === "number") return control.value === "" ? null : Number(control.value);
+  if (type === "list") {
+    const kind = container.id === "siteFields" ? "site" : "theme";
+    const path = control.dataset.path;
+    const original = getPath(state[kind].values, path);
+    const samples = Array.isArray(original) ? original : [];
+    return control.value.split(/\r?\n/).map((item, index) => {
+      const textValue = item.trim();
+      const sample = samples[index] ?? samples[0];
+      if (typeof sample === "number" && textValue !== "" && Number.isFinite(Number(textValue))) return Number(textValue);
+      if (typeof sample === "boolean") return ["true", "1", "yes", "on"].includes(textValue.toLowerCase());
+      return textValue;
+    }).filter((item) => item !== "");
+  }
+  if (type === "select") {
+    const options = JSON.parse(control.dataset.options || "[]");
+    const matched = options.find((option) => String(option.value) === String(control.value));
+    return matched ? matched.value : control.value;
+  }
+  return control.value;
+}
+
+function setConfigPathValue(container, path, value) {
+  const controls = $$(`[data-path="${CSS.escape(path)}"]`, container);
+  const select = controls.find((control) => control.dataset.type === "select");
+  const custom = controls.find((control) => control.dataset.type === "custom");
+  if (select) {
+    const known = Array.from(select.options).some((option) => option.value === String(value ?? ""));
+    if (known && String(value ?? "") !== "__custom__") {
+      select.value = String(value ?? "");
+      if (custom) custom.classList.add("hidden");
+    } else if (custom) {
+      select.value = "__custom__";
+      custom.classList.remove("hidden");
+      custom.value = value == null ? "" : String(value);
+    }
+  }
+  controls.forEach((control) => {
+    const type = control.dataset.type;
+    if (type === "select") return;
+    if (type === "boolean") control.checked = Boolean(value);
+    else if (type === "list") control.value = Array.isArray(value) ? value.join("\n") : (value == null ? "" : String(value));
+    else if (type === "custom") {
+      if (control.classList.contains("hidden")) return;
+      control.value = value == null ? "" : String(value);
+    } else if (type === "yaml" && typeof value !== "string") control.value = JSON.stringify(value ?? null, null, 2);
+    else control.value = value == null ? "" : String(value);
+  });
+}
+
+function updateResetButton(kind, path) {
+  const config = state[kind];
+  const cell = $(`[data-config-field="${CSS.escape(path)}"]`);
+  if (!cell) return;
+  const button = $(".field-reset-button", cell);
+  if (!button) return;
+  const active = config.resetPaths.has(path);
+  button.classList.toggle("active", active);
+  button.textContent = active ? "已重置" : "重置默认";
+  button.title = active ? "保存后将从根目录覆盖文件删除此键" : "删除根目录覆盖文件中的此键";
+}
+
+function handleConfigControlChange(kind, control) {
+  const path = control.dataset.path;
+  if (!path) return;
+  const config = state[kind];
+  const container = kind === "site" ? $("#siteFields") : $("#themeFields");
+  const value = readConfigPathValue(container, path);
+  const original = getPath(config.values, path);
+  if (valuesEqual(value, original)) config.dirtyPaths.delete(path);
+  else config.dirtyPaths.add(path);
+  if (!config.resetPaths.has(path) || !valuesEqual(value, getPath(config.baseValues, path))) {
+    config.resetPaths.delete(path);
+  }
+  updateResetButton(kind, path);
+  markDirty(kind);
+}
+
+function resetConfigField(kind, path) {
+  const config = state[kind];
+  const container = kind === "site" ? $("#siteFields") : $("#themeFields");
+  config.resetPaths.add(path);
+  config.dirtyPaths.delete(path);
+  setConfigPathValue(container, path, getPath(config.baseValues, path));
+  updateResetButton(kind, path);
+  markDirty(kind);
+}
+
 function renderConfigGroups(container, groups, values, kind) {
   container.replaceChildren();
   groups.forEach((group, groupIndex) => {
     const card = document.createElement("details");
-    card.className = "config-group";
-    card.open = groupIndex < 3;
+    card.className = `config-group ${group.dynamic ? "dynamic-config-group" : ""}`.trim();
+    card.dataset.groupId = group.id;
+    const defaultOpen = group.defaultOpen !== undefined ? group.defaultOpen : groupIndex < 3;
+    card.open = defaultOpen;
+    card.dataset.defaultOpen = defaultOpen ? "true" : "false";
     const heading = document.createElement("summary");
     heading.className = "group-heading";
     const copy = document.createElement("div");
@@ -285,6 +571,7 @@ function renderConfigGroups(container, groups, values, kind) {
     group.fields.forEach((field) => {
       const cell = document.createElement("div");
       cell.className = `setting-field ${field.span === 2 ? "span-2" : ""} ${field.type === "boolean" ? "boolean-field" : ""}`.trim();
+      cell.dataset.configField = field.path;
       const textWrap = document.createElement("div");
       const label = document.createElement("label");
       label.className = "setting-label";
@@ -293,44 +580,88 @@ function renderConfigGroups(container, groups, values, kind) {
       pathLabel.className = "setting-path";
       pathLabel.textContent = field.path;
       textWrap.append(label, pathLabel);
-      if (field.hint && field.type !== "boolean") {
+      if (field.hint) {
         const hint = document.createElement("small");
         hint.className = "setting-hint";
         hint.textContent = field.hint;
         textWrap.append(hint);
       }
+      const defaultValue = field.default !== undefined ? field.default : getPath(state[kind].baseValues, field.path);
+      if (defaultValue !== undefined) {
+        const defaultHint = document.createElement("small");
+        defaultHint.className = "setting-default";
+        defaultHint.textContent = `默认：${formatDefaultValue(defaultValue)}`;
+        textWrap.append(defaultHint);
+      }
       const control = createControl(field, getPath(values, field.path));
       cell.append(textWrap, control);
+      if (kind === "theme" && (state.theme.overridePaths.has(field.path) || state.theme.resetPaths.has(field.path))) {
+        const reset = document.createElement("button");
+        reset.type = "button";
+        reset.className = "field-reset-button";
+        reset.dataset.resetPath = field.path;
+        reset.textContent = state.theme.resetPaths.has(field.path) ? "已重置" : "重置默认";
+        if (state.theme.resetPaths.has(field.path)) reset.classList.add("active");
+        reset.title = "删除根目录覆盖文件中的此键";
+        cell.append(reset);
+      }
       grid.append(cell);
     });
     card.append(heading, grid);
     container.append(card);
   });
   $$("input, select, textarea", container).forEach((control) => {
-    control.addEventListener("input", () => markDirty(kind));
-    control.addEventListener("change", () => markDirty(kind));
+    if (!control.dataset.path) return;
+    control.addEventListener("input", () => handleConfigControlChange(kind, control));
+    control.addEventListener("change", () => handleConfigControlChange(kind, control));
   });
+  $$("[data-image-picker-path]", container).forEach((button) => {
+    button.addEventListener("click", () => openConfigImagePicker(kind, button.dataset.imagePickerPath));
+  });
+  $$("[data-reset-path]", container).forEach((button) => {
+    button.addEventListener("click", () => resetConfigField(kind, button.dataset.resetPath));
+  });
+  applyConfigSearch(kind);
 }
 
-function collectConfigValues(container) {
-  const values = {};
-  $$("[data-path]", container).forEach((control) => {
-    const type = control.dataset.type;
-    if (type === "custom" && control.classList.contains("hidden")) return;
-    const path = control.dataset.path;
-    if (!path) return;
-    if (type === "boolean") values[path] = control.checked;
-    else if (type === "number") values[path] = control.value === "" ? null : Number(control.value);
-    else if (type === "list") values[path] = control.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
-    else if (type === "select") {
-      const options = JSON.parse(control.dataset.options || "[]");
-      const matched = options.find((option) => String(option.value) === String(control.value));
-      values[path] = matched ? matched.value : control.value;
+function collectConfigChanges(kind, container) {
+  const config = state[kind];
+  const changes = {};
+  const resetPaths = new Set(config.resetPaths);
+  config.dirtyPaths.forEach((path) => {
+    if (resetPaths.has(path)) return;
+    const field = config.fieldMap.get(path) || {};
+    let value = readConfigPathValue(container, path);
+    const type = field.type || ($$(`[data-path="${CSS.escape(path)}"]`, container)[0]?.dataset.type || "text");
+    if (type === "number" && value === null) {
+      resetPaths.add(path);
+      return;
     }
-    else if (type === "custom") values[path] = control.value;
-    else values[path] = control.value;
+    if (type === "image") value = String(value ?? "");
+    changes[path] = { type, value };
   });
-  return values;
+  return { changes, reset_paths: Array.from(resetPaths) };
+}
+
+function applyConfigSearch(kind) {
+  const term = String(state[kind].searchTerm || "").trim().toLocaleLowerCase("zh-CN");
+  const container = kind === "site" ? $("#siteFields") : $("#themeFields");
+  if (!container) return;
+  $$(".config-group", container).forEach((group) => {
+    const groupTitle = $(".group-heading h2", group)?.textContent || "";
+    const groupDescription = $(".group-heading p", group)?.textContent || "";
+    const groupMatches = term && `${groupTitle} ${groupDescription}`.toLocaleLowerCase("zh-CN").includes(term);
+    let visibleFields = 0;
+    $$(".setting-field", group).forEach((field) => {
+      const haystack = `${field.textContent} ${field.dataset.configField || ""}`.toLocaleLowerCase("zh-CN");
+      const match = !term || groupMatches || haystack.includes(term);
+      field.classList.toggle("hidden", !match);
+      if (match) visibleFields += 1;
+    });
+    group.classList.toggle("hidden", Boolean(term) && !groupMatches && visibleFields === 0);
+    if (term && (groupMatches || visibleFields > 0)) group.open = true;
+    else if (!term) group.open = group.dataset.defaultOpen === "true";
+  });
 }
 
 function setConfigMode(kind, mode) {
@@ -372,9 +703,14 @@ async function loadSiteConfig(options = {}) {
   try {
     const data = await api("/api/site-config", { cache: "no-store" });
     state.site.values = data.values || {};
+    state.site.baseValues = data.base_values || {};
+    state.site.overridePaths = new Set(data.override_paths || []);
     state.site.loaded = true;
     state.site.rawDirty = false;
-    clearDirty("site");
+    state.site.dirtyPaths = new Set();
+    state.site.resetPaths = new Set();
+    state.site.dirty = false;
+    rebuildConfigGroups("site");
     renderConfigGroups($("#siteFields"), state.site.groups, state.site.values, "site");
     $("#siteRawYaml").value = data.raw_yaml || "";
     $("#siteSaveHint").textContent = "配置已加载"; $("#siteSaveHint").className = "save-state";
@@ -392,14 +728,21 @@ async function saveSiteConfig(event) {
   const button = $("#saveSiteButton");
   setButtonBusy(button, true, "正在保存...");
   try {
-    const payload = state.site.mode === "raw"
-      ? { mode: "raw", raw_yaml: $("#siteRawYaml").value }
-      : { mode: "fields", values: collectConfigValues($("#siteFields")) };
+    let payload;
+    if (state.site.mode === "raw") {
+      payload = { mode: "raw", raw_yaml: $("#siteRawYaml").value };
+    } else {
+      const fieldChanges = collectConfigChanges("site", $("#siteFields"));
+      if (!Object.keys(fieldChanges.changes).length && !fieldChanges.reset_paths.length) {
+        toast("没有需要保存的修改", "表单值没有变化。", "info", 2200);
+        return;
+      }
+      payload = { mode: "fields", changes: fieldChanges.changes, reset_paths: fieldChanges.reset_paths };
+    }
     await api("/api/site-config", { method: "PUT", body: JSON.stringify(payload) });
-    clearDirty("site");
-    state.site.rawDirty = false;
+    await loadSiteConfig({ quiet: true });
     $("#siteSaveHint").textContent = `已保存 · ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`; $("#siteSaveHint").className = "save-state saved";
-    toast("站点配置已保存", "YAML 注释和结构已尽量保留。", "success");
+    toast("站点配置已保存", "只写入了本次修改的字段。", "success");
   } catch (error) {
     toast("保存失败", error.message, "error");
   } finally {
@@ -412,13 +755,22 @@ async function loadThemeConfig(options = {}) {
   try {
     const data = await api("/api/theme-config", { cache: "no-store" });
     state.theme.values = data.values || {};
+    state.theme.baseValues = data.base_values || {};
+    state.theme.overridePaths = new Set(data.override_paths || []);
     state.theme.loaded = true;
     state.theme.rawDirty = false;
     state.theme.menuItems = Array.isArray(data.menu_items) ? data.menu_items : [];
     state.theme.socialItems = Array.isArray(data.social_items) ? data.social_items : [];
     state.theme.menuSimple = Boolean(data.menu_is_simple);
     state.theme.socialSimple = Boolean(data.social_is_simple);
-    clearDirty("theme");
+    state.theme.menuOriginal = cloneValue(state.theme.menuItems);
+    state.theme.socialOriginal = cloneValue(state.theme.socialItems);
+    state.theme.menuDirty = false;
+    state.theme.socialDirty = false;
+    state.theme.dirtyPaths = new Set();
+    state.theme.resetPaths = new Set();
+    state.theme.dirty = false;
+    rebuildConfigGroups("theme");
     renderConfigGroups($("#themeFields"), state.theme.groups, state.theme.values, "theme");
     $("#themeRawYaml").value = data.raw_yaml || "";
     $("#themeSourceText").textContent = `${data.base_path}  +  ${data.override_path}`;
@@ -429,11 +781,12 @@ async function loadThemeConfig(options = {}) {
     if (!state.theme.menuSimple || !state.theme.socialSimple) setConfigMode("theme", "raw");
     else setConfigMode("theme", "fields");
     $("#themeSaveHint").textContent = "配置已加载"; $("#themeSaveHint").className = "save-state";
-    if (!quiet) toast("主题配置已刷新", "已合并主题完整配置和根覆盖项。", "success", 2400);
+    if (!quiet) toast("主题配置已刷新", "界面值来自主题默认 + 根目录覆盖，保存只写改动项。", "success", 2400);
   } catch (error) {
     state.theme.loaded = false;
-    $("#themeSaveHint").textContent = error.message; $("#themeSaveHint").className = "save-state dirty";
-    if (!quiet) toast("无法加载主题配置", error.message, "error");
+    console.error("主题配置加载失败", error);
+    $("#themeSaveHint").textContent = `加载失败：${error.message}`; $("#themeSaveHint").className = "save-state dirty";
+    toast("无法加载主题配置", error.message, "error", 8000);
   }
 }
 
@@ -462,9 +815,15 @@ function renderMenuItems() {
     remove.innerHTML = '<svg><use href="#i-trash"></use></svg>';
     [name, url, icon].forEach((input, part) => input.addEventListener("input", () => {
       item[["name", "url", "icon"][part]] = input.value;
+      state.theme.menuDirty = true;
       markDirty("theme");
     }));
-    remove.addEventListener("click", () => { state.theme.menuItems.splice(index, 1); markDirty("theme"); renderMenuItems(); });
+    remove.addEventListener("click", () => {
+      state.theme.menuItems.splice(index, 1);
+      state.theme.menuDirty = true;
+      markDirty("theme");
+      renderMenuItems();
+    });
     row.append(name, url, icon, remove);
     container.append(row);
   });
@@ -487,9 +846,15 @@ function renderSocialItems() {
     remove.innerHTML = '<svg><use href="#i-trash"></use></svg>';
     [icon, url, description, color].forEach((input, part) => input.addEventListener("input", () => {
       item[["icon", "url", "description", "color"][part]] = input.value;
+      state.theme.socialDirty = true;
       markDirty("theme");
     }));
-    remove.addEventListener("click", () => { state.theme.socialItems.splice(index, 1); markDirty("theme"); renderSocialItems(); });
+    remove.addEventListener("click", () => {
+      state.theme.socialItems.splice(index, 1);
+      state.theme.socialDirty = true;
+      markDirty("theme");
+      renderSocialItems();
+    });
     row.append(icon, url, description, color, remove);
     container.append(row);
   });
@@ -497,7 +862,10 @@ function renderSocialItems() {
 
 async function saveThemeConfig(event) {
   event.preventDefault();
-  if (!state.theme.loaded) return;
+  if (!state.theme.loaded) {
+    toast("主题配置尚未加载", "请先修复页面顶部的加载错误，再重新保存。", "warning", 6500);
+    return;
+  }
   const button = $("#saveThemeButton");
   setButtonBusy(button, true, "正在保存...");
   try {
@@ -505,20 +873,245 @@ async function saveThemeConfig(event) {
     if (state.theme.mode === "raw") {
       payload = { mode: "raw", raw_target: "override", raw_yaml: $("#themeRawYaml").value };
     } else {
-      payload = { mode: "fields", values: collectConfigValues($("#themeFields")) };
-      if (state.theme.menuSimple) payload.menu_items = state.theme.menuItems;
-      if (state.theme.socialSimple) payload.social_items = state.theme.socialItems;
+      let payloadMenu;
+      let payloadSocial;
+      const fieldChanges = collectConfigChanges("theme", $("#themeFields"));
+      if (state.theme.menuSimple && state.theme.menuDirty) {
+        payloadMenu = state.theme.menuItems;
+      }
+      if (state.theme.socialSimple && state.theme.socialDirty) {
+        payloadSocial = state.theme.socialItems;
+      }
+      if (!Object.keys(fieldChanges.changes).length && !fieldChanges.reset_paths.length && !state.theme.menuDirty && !state.theme.socialDirty) {
+        toast("没有需要保存的修改", "表单值没有变化。", "info", 2200);
+        return;
+      }
+      payload = { mode: "fields", changes: fieldChanges.changes, reset_paths: fieldChanges.reset_paths };
+      if (typeof payloadMenu !== "undefined") payload.menu_items = payloadMenu;
+      if (typeof payloadSocial !== "undefined") payload.social_items = payloadSocial;
     }
     await api("/api/theme-config", { method: "PUT", body: JSON.stringify(payload) });
-    clearDirty("theme");
-    state.theme.rawDirty = false;
+    await loadThemeConfig({ quiet: true });
     $("#themeSaveHint").textContent = `已保存 · ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`; $("#themeSaveHint").className = "save-state saved";
-    toast("主题配置已保存", "修改已写入根目录覆盖文件。", "success");
+    toast("主题配置已保存", "只写入了本次修改或重置的字段。", "success");
   } catch (error) {
     toast("保存失败", error.message, "error");
   } finally {
     setButtonBusy(button, false);
   }
+}
+
+function configImageValue(image) {
+  return image?.relative_path ? `/img/${image.relative_path}` : "";
+}
+
+function configImagePreviewUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (text.startsWith("/img/")) {
+    const relative = text.slice(5);
+    const image = state.configImage.images.find((item) => item.relative_path === relative);
+    if (image) return image.url;
+    return `/api/images/file?path=${encodeURIComponent(relative)}`;
+  }
+  return text;
+}
+
+function setConfigImagePreview(value) {
+  const text = String(value || "").trim();
+  const image = $("#configImagePreviewImage");
+  const empty = $("#configImagePreviewEmpty");
+  $("#configImageCurrentValue").textContent = text || "未设置";
+  $("#configImageExternalHint").textContent = state.configImage.external ? "当前选择：直接使用外部 URL" : "";
+  if (text) {
+    image.src = configImagePreviewUrl(text);
+    image.classList.remove("hidden");
+    empty.classList.add("hidden");
+  } else {
+    image.removeAttribute("src");
+    image.classList.add("hidden");
+    empty.classList.remove("hidden");
+  }
+}
+
+function createConfigImageItem(image, isNew) {
+  const value = configImageValue(image);
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `cover-item ${isNew ? "new" : ""} ${state.configImage.selected === value ? "selected" : ""}`;
+  button.title = image.relative_path;
+  const thumbnail = document.createElement("img");
+  thumbnail.loading = "lazy";
+  thumbnail.src = image.url;
+  thumbnail.alt = image.name;
+  button.append(thumbnail);
+  if (isNew) {
+    const badge = document.createElement("span");
+    badge.className = "cover-new-badge";
+    badge.textContent = "新";
+    button.append(badge);
+  }
+  if (state.configImage.selected === value) {
+    const check = document.createElement("span");
+    check.className = "cover-check";
+    check.textContent = "✓";
+    button.append(check);
+  }
+  button.addEventListener("click", () => {
+    state.configImage.selected = state.configImage.selected === value ? "" : value;
+    state.configImage.external = "";
+    renderConfigImageLibrary();
+    setConfigImagePreview(state.configImage.selected);
+  });
+  return button;
+}
+
+function renderConfigImageLibrary() {
+  const container = $("#configImageLibrary");
+  container.replaceChildren();
+  if (!state.configImage.images.length) {
+    const empty = document.createElement("div");
+    empty.className = "config-image-empty";
+    empty.textContent = "source/img 中还没有图片，可从 URL 添加或上传本地图片。";
+    container.append(empty);
+    $("#confirmConfigImageButton").disabled = !state.configImage.selected;
+    return;
+  }
+  const images = [...state.configImage.images].sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+  const newImages = images.filter((image) => state.configImage.newImages.has(image.relative_path));
+  const normalImages = images.filter((image) => !state.configImage.newImages.has(image.relative_path));
+  const appendGroup = (title, items, isNew) => {
+    if (!items.length) return;
+    const group = document.createElement("section");
+    group.className = "cover-group";
+    if (title) {
+      const heading = document.createElement("strong");
+      heading.className = "cover-group-title";
+      heading.textContent = title;
+      group.append(heading);
+    }
+    const grid = document.createElement("div");
+    grid.className = "cover-group-grid";
+    items.forEach((image) => grid.append(createConfigImageItem(image, isNew)));
+    group.append(grid);
+    container.append(group);
+  };
+  appendGroup("新加入", newImages, true);
+  appendGroup("", normalImages, false);
+  $("#confirmConfigImageButton").disabled = !state.configImage.selected;
+}
+
+async function openConfigImagePicker(kind, path) {
+  const container = kind === "site" ? $("#siteFields") : $("#themeFields");
+  const value = readConfigPathValue(container, path);
+  const loadToken = state.configImage.loadToken + 1;
+  state.configImage = {
+    ...state.configImage,
+    kind,
+    path,
+    selected: String(value || "").trim(),
+    external: "",
+    images: [],
+    newImages: new Set(),
+    loadToken,
+  };
+  $("#configImagePath").textContent = path;
+  $("#configImageFileInput").value = "";
+  setConfigImagePreview(state.configImage.selected);
+  renderConfigImageLibrary();
+  const dialog = $("#configImageDialog");
+  if (!dialog.open) dialog.showModal();
+  try {
+    const data = await api("/api/images?sort=name", { cache: "no-store" });
+    if (state.configImage.loadToken !== loadToken) return;
+    state.configImage.images = data.images || [];
+    state.configImage.external = state.configImage.selected && !state.configImage.selected.startsWith("/img/") ? state.configImage.selected : "";
+    setConfigImagePreview(state.configImage.selected);
+    renderConfigImageLibrary();
+  } catch (error) {
+    closeConfigImageDialog();
+    toast("无法打开图片库", error.message, "error");
+  }
+}
+
+function closeConfigImageDialog() {
+  state.configImage.loadToken += 1;
+  state.configImage = { ...state.configImage, kind: "", path: "", selected: "", external: "", images: [], newImages: new Set() };
+  const dialog = $("#configImageDialog");
+  if (dialog?.open) dialog.close();
+}
+
+async function uploadConfigImage(file) {
+  if (!file) return;
+  if (file.size > 8 * 1024 * 1024) toast("图片较大", "建议压缩后再使用，以免影响页面加载速度。", "warning", 6000);
+  const button = $("#uploadConfigImageButton");
+  setButtonBusy(button, true, "上传中...");
+  try {
+    const form = new FormData();
+    form.append("scope", "config");
+    form.append("file", file);
+    const data = await api("/api/images/upload", { method: "POST", body: form });
+    const image = data.image;
+    state.configImage.images = [image, ...state.configImage.images.filter((item) => item.relative_path !== image.relative_path)];
+    state.configImage.newImages.add(image.relative_path);
+    state.configImage.selected = configImageValue(image);
+    state.configImage.external = "";
+    renderConfigImageLibrary();
+    setConfigImagePreview(state.configImage.selected);
+    toast("图片已上传", image.relative_path, "success");
+  } catch (error) {
+    toast("上传图片失败", error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+async function addConfigImageFromUrl() {
+  const url = window.prompt("请输入图片 URL：");
+  if (!url) return;
+  const button = $("#addConfigImageUrlButton");
+  setButtonBusy(button, true, "添加中...");
+  try {
+    const data = await api("/api/images/from-url", {
+      method: "POST",
+      body: JSON.stringify({ url: url.trim(), scope: "config" }),
+    });
+    const image = data.image;
+    state.configImage.images = [image, ...state.configImage.images.filter((item) => item.relative_path !== image.relative_path)];
+    state.configImage.newImages.add(image.relative_path);
+    state.configImage.selected = configImageValue(image);
+    state.configImage.external = "";
+    renderConfigImageLibrary();
+    setConfigImagePreview(state.configImage.selected);
+    toast("图片已加入图片库", image.relative_path, "success");
+  } catch (error) {
+    if (error.details?.download_failed && window.confirm(`${error.message}
+
+是否直接将该 URL 写入配置？`)) {
+      state.configImage.selected = url.trim();
+      state.configImage.external = url.trim();
+      renderConfigImageLibrary();
+      setConfigImagePreview(state.configImage.selected);
+    } else {
+      toast("添加图片失败", error.message, "error");
+    }
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+function confirmConfigImage() {
+  if (!state.configImage.selected || !state.configImage.path) return;
+  const kind = state.configImage.kind;
+  const path = state.configImage.path;
+  const value = state.configImage.selected;
+  const container = kind === "site" ? $("#siteFields") : $("#themeFields");
+  setConfigPathValue(container, path, value);
+  const control = $(`[data-path="${CSS.escape(path)}"]`, container);
+  if (control) handleConfigControlChange(kind, control);
+  closeConfigImageDialog();
+  const kindLabel = kind === "theme" ? "主题" : "站点";
+  toast("图片路径已填入", `${kindLabel}配置：${value}`, "success");
 }
 
 function formatBytes(bytes) {
@@ -2830,18 +3423,24 @@ function bindEvents() {
   $("#pathDisplay").addEventListener("click", openBlogFolder);
   $("#siteForm").addEventListener("submit", saveSiteConfig);
   $("#themeForm").addEventListener("submit", saveThemeConfig);
+  $("#saveSiteButton").addEventListener("click", saveSiteConfig);
+  $("#saveThemeButton").addEventListener("click", saveThemeConfig);
   $$("#siteModeSwitch button").forEach((button) => button.addEventListener("click", () => setConfigMode("site", button.dataset.mode)));
   $$("#themeModeSwitch button").forEach((button) => button.addEventListener("click", () => setConfigMode("theme", button.dataset.mode)));
   $("#siteRawYaml").addEventListener("input", () => { state.site.rawDirty = true; markDirty("site"); });
   $("#themeRawYaml").addEventListener("input", () => { state.theme.rawDirty = true; markDirty("theme"); });
+  $("#siteConfigSearch").addEventListener("input", (event) => { state.site.searchTerm = event.target.value; applyConfigSearch("site"); });
+  $("#themeConfigSearch").addEventListener("input", (event) => { state.theme.searchTerm = event.target.value; applyConfigSearch("theme"); });
 
   $("#addMenuItemButton").addEventListener("click", () => {
     state.theme.menuItems.push({ name: "新页面", url: "/", icon: "fas fa-link", extra: [] });
+    state.theme.menuDirty = true;
     markDirty("theme");
     renderMenuItems();
   });
   $("#addSocialItemButton").addEventListener("click", () => {
     state.theme.socialItems.push({ icon: "fab fa-github", url: "https://github.com/", description: "Github", color: "#24292e" });
+    state.theme.socialDirty = true;
     markDirty("theme");
     renderSocialItems();
   });
@@ -2894,6 +3493,14 @@ function bindEvents() {
   $("#coverFileInput").addEventListener("change", () => uploadCoverImage($("#coverFileInput").files?.[0]));
   $("#addCoverUrlButton").addEventListener("click", addCoverFromUrl);
   $("#coverDialog").addEventListener("cancel", (event) => { event.preventDefault(); closeCoverDialog(); });
+  $("#closeConfigImageButton").addEventListener("click", closeConfigImageDialog);
+  $("#cancelConfigImageButton").addEventListener("click", closeConfigImageDialog);
+  $("#confirmConfigImageButton").addEventListener("click", confirmConfigImage);
+  $("#uploadConfigImageButton").addEventListener("click", () => $("#configImageFileInput").click());
+  $("#configImageFileInput").addEventListener("change", () => uploadConfigImage($("#configImageFileInput").files?.[0]));
+  $("#addConfigImageUrlButton").addEventListener("click", addConfigImageFromUrl);
+  $("#configImageDialog").addEventListener("cancel", (event) => { event.preventDefault(); closeConfigImageDialog(); });
+  $("#configImageDialog").addEventListener("click", (event) => { if (event.target === $("#configImageDialog")) closeConfigImageDialog(); });
   $("#refreshImagesButton").addEventListener("click", () => loadImages());
   $("#openImagesFolderButton").addEventListener("click", () => openImageFolder(""));
   $("#imageSearch").addEventListener("input", renderImages);

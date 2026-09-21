@@ -572,6 +572,23 @@ select.setting-control { cursor: pointer; }
 .save-state { display: inline-flex; align-items: center; min-height: 28px; border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px; color: var(--text-muted); background: var(--panel-soft); font-size: 10.5px; font-weight: 650; white-space: nowrap; transition: color 180ms ease, background 180ms ease, border-color 180ms ease; }
 .save-state.dirty { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 38%, var(--border)); background: var(--warning-soft); }
 .save-state.saved { color: var(--success); border-color: color-mix(in srgb, var(--success) 34%, var(--border)); background: var(--success-soft); }
+.config-search { display: flex; align-items: center; gap: 7px; width: min(220px, 34vw); height: 32px; border: 1px solid var(--border-strong); border-radius: 8px; padding: 0 9px; background: var(--panel-soft); }
+.config-search:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent); }
+.config-search svg { width: 14px; height: 14px; color: var(--text-muted); flex: 0 0 auto; }
+.config-search input { width: 100%; border: 0; background: transparent; color: var(--text); font-size: 11px; }
+.setting-default { display: block; margin-top: 5px; color: color-mix(in srgb, var(--text-muted) 82%, var(--success)); font-family: var(--mono); font-size: 9.5px; line-height: 1.4; }
+.image-path-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.image-picker-button { min-height: 37px; padding-inline: 11px; white-space: nowrap; }
+.field-reset-button { margin-top: 9px; border: 1px solid var(--border); border-radius: 7px; padding: 5px 8px; color: var(--text-muted); background: transparent; font-size: 10px; }
+.field-reset-button:hover { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 44%, var(--border)); }
+.field-reset-button.active { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 44%, var(--border)); background: var(--warning-soft); }
+.config-image-empty { display: grid; place-items: center; min-height: 180px; border: 1px dashed var(--border-strong); border-radius: 12px; color: var(--text-muted); background: var(--panel-soft); font-size: 11.5px; text-align: center; }
+.dynamic-config-group .group-heading { background: color-mix(in srgb, var(--panel-soft) 52%, transparent); }
+.dynamic-config-group .group-count { color: var(--text-soft); }
+@media (max-width: 760px) {
+  .config-search { width: 100%; }
+  .image-path-control { grid-template-columns: 1fr; }
+}
 #siteForm, #themeForm { width: 100%; }
 
 /* Lists and media */
