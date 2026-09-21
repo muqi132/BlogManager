@@ -1,5 +1,7 @@
 # Blog Manager
 
+100%AI（）
+
 一个面向 Hexo + Butterfly 的本地博客控制面板。项目本身不包含任何个人路径、GitHub 账号或 Token；首次运行时由每位用户填写自己的配置。
 
 ## 启动前准备
