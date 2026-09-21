@@ -30,6 +30,7 @@ const state = {
   activeTaskKind: null,
   eventSource: null,
   logEntries: [],
+  logHistory: { offset: 0, lines: [], total: 0, hasMore: false, loading: false },
   pendingDeploy: false,
   allowUnload: false,
   posts: [],
@@ -68,6 +69,7 @@ const state = {
     resetPaths: new Set(),
     fieldMap: new Map(),
     groups: SCHEMA.themeGroups,
+    fieldDescriptions: {},
     menuItems: [],
     menuSimple: true,
     menuOriginal: [],
@@ -296,7 +298,9 @@ function buildDynamicConfigGroups(kind, values) {
       label: humanizeConfigKey(leaf.path.split(".").pop()),
       type,
       imagePicker: type === "image",
-      hint: "自动扫描的配置项；复杂结构请在完整 YAML 模式中编辑。",
+      hint: config.fieldDescriptions?.[leaf.path] || "暂无说明，请参考主题文档。",
+      title: config.fieldDescriptions?.[leaf.path] || "",
+      dynamic: true,
       default: baseValue,
     });
   }
@@ -582,8 +586,9 @@ function renderConfigGroups(container, groups, values, kind) {
       textWrap.append(label, pathLabel);
       if (field.hint) {
         const hint = document.createElement("small");
-        hint.className = "setting-hint";
+        hint.className = `setting-hint${field.dynamic ? " clamped" : ""}`;
         hint.textContent = field.hint;
+        hint.title = field.title || field.hint;
         textWrap.append(hint);
       }
       const defaultValue = field.default !== undefined ? field.default : getPath(state[kind].baseValues, field.path);
@@ -756,6 +761,7 @@ async function loadThemeConfig(options = {}) {
     const data = await api("/api/theme-config", { cache: "no-store" });
     state.theme.values = data.values || {};
     state.theme.baseValues = data.base_values || {};
+    state.theme.fieldDescriptions = data.field_descriptions || {};
     state.theme.overridePaths = new Set(data.override_paths || []);
     state.theme.loaded = true;
     state.theme.rawDirty = false;
@@ -774,6 +780,15 @@ async function loadThemeConfig(options = {}) {
     renderConfigGroups($("#themeFields"), state.theme.groups, state.theme.values, "theme");
     $("#themeRawYaml").value = data.raw_yaml || "";
     $("#themeSourceText").textContent = `${data.base_path}  +  ${data.override_path}`;
+    const themeWarnings = Array.isArray(data.warnings) ? data.warnings : [];
+    const warningBox = $("#themeConfigWarnings");
+    if (warningBox) {
+      warningBox.classList.toggle("hidden", !themeWarnings.length);
+      $("#themeConfigWarningText").textContent = themeWarnings.map((item) => item.message || item.path).join("；");
+    }
+    if (themeWarnings.length && !quiet) {
+      toast("主题配置存在异常项", themeWarnings.map((item) => item.message || item.path).join("；"), "warning", 10000);
+    }
     $("#menuComplexNotice").classList.toggle("hidden", state.theme.menuSimple);
     $("#socialComplexNotice").classList.toggle("hidden", state.theme.socialSimple);
     renderMenuItems();
@@ -2159,9 +2174,20 @@ async function deletePost(post) {
   }
 }
 
+function closeNewPostDialog() {
+  $("#newPostDialog").close();
+  $("#newPostForm").reset();
+  $("#newPostFolderCustomField").classList.add("hidden");
+}
+
 async function createPost(event) {
   event.preventDefault();
-  if (event.submitter?.value === "cancel") { $("#newPostDialog").close(); $("#newPostForm").reset(); return; }
+  const title = $("#newPostTitle").value.trim();
+  if (!title) {
+    toast("标题不能为空", "请填写文章标题后再创建。", "warning");
+    $("#newPostTitle").focus();
+    return;
+  }
   const button = $("#confirmNewPostButton");
   setButtonBusy(button, true, "创建中...");
   try {
@@ -2169,15 +2195,14 @@ async function createPost(event) {
     await api("/api/posts", {
       method: "POST",
       body: JSON.stringify({
-        title: $("#newPostTitle").value,
+        title,
         filename: $("#newPostFilename").value,
         folder: $("#newPostFolder").value === "__new__" ? $("#newPostFolderCustom").value : $("#newPostFolder").value,
         categories: split($("#newPostCategories").value),
         tags: split($("#newPostTags").value),
       }),
     });
-    $("#newPostDialog").close();
-    $("#newPostForm").reset();
+    closeNewPostDialog();
     toast("文章已创建", "正在刷新文章列表。", "success");
     await loadPosts({ quiet: true });
   } catch (error) {
@@ -2416,6 +2441,71 @@ function updateTaskStatus(task) {
   element.className = `task-status ${task.status}`;
   element.innerHTML = `<span></span><b>${labels[task.status] || task.status}</b>`;
   element.classList.remove("hidden");
+}
+
+function updateLogHistoryMeta() {
+  const history = state.logHistory;
+  $("#logHistoryMeta").textContent = history.total
+    ? `共 ${history.total} 行，已加载 ${history.lines.length} 行`
+    : "暂无历史日志";
+  $("#loadMoreLogsButton").disabled = history.loading || !history.hasMore;
+}
+
+async function loadLogHistory(reset = false) {
+  const history = state.logHistory;
+  if (history.loading) return;
+  history.loading = true;
+  updateLogHistoryMeta();
+  try {
+    const offset = reset ? 0 : history.offset;
+    const data = await api(`/api/logs?limit=200&offset=${offset}`, { cache: "no-store" });
+    const incoming = Array.isArray(data.lines) ? data.lines : [];
+    history.lines = reset ? incoming : [...incoming, ...history.lines];
+    history.offset = data.offset || 0;
+    history.total = data.total || 0;
+    history.hasMore = Boolean(data.has_more);
+    $("#logHistoryContent").textContent = history.lines.length ? history.lines.join("\n") : "暂无历史日志";
+    if (reset) $("#logHistoryContent").scrollTop = $("#logHistoryContent").scrollHeight;
+  } catch (error) {
+    toast("无法读取历史日志", error.message, "error");
+  } finally {
+    history.loading = false;
+    updateLogHistoryMeta();
+  }
+}
+
+async function openLogHistory() {
+  state.logHistory = { offset: 0, lines: [], total: 0, hasMore: false, loading: false };
+  $("#logHistoryContent").textContent = "正在读取日志...";
+  $("#logHistoryDialog").showModal();
+  await loadLogHistory(true);
+}
+
+function closeLogHistory() {
+  $("#logHistoryDialog").close();
+}
+
+async function downloadLogHistory() {
+  const link = document.createElement("a");
+  link.href = "/api/logs/download";
+  link.download = "blogmanager.log";
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
+async function clearPersistentLogs() {
+  if (!window.confirm("确定清空所有历史日志吗？此操作不可撤销。")) return;
+  try {
+    await api("/api/logs", { method: "DELETE", body: "{}" });
+    clearLog();
+    state.logHistory = { offset: 0, lines: [], total: 0, hasMore: false, loading: false };
+    $("#logHistoryContent").textContent = "暂无历史日志";
+    updateLogHistoryMeta();
+    toast("历史日志已清空", "", "success");
+  } catch (error) {
+    toast("无法清空历史日志", error.message, "error");
+  }
 }
 
 function clearLog() {
@@ -3454,15 +3544,24 @@ function bindEvents() {
     clearTimeout(checkPreviewPort.timer);
     checkPreviewPort.timer = setTimeout(() => checkPreviewPort(false), 450);
   });
+  $("#historyLogButton").addEventListener("click", openLogHistory);
   $("#copyLogButton").addEventListener("click", copyLog);
   $("#clearLogButton").addEventListener("click", clearLog);
+  $("#closeLogHistoryButton").addEventListener("click", closeLogHistory);
+  $("#closeLogHistoryFooterButton").addEventListener("click", closeLogHistory);
+  $("#loadMoreLogsButton").addEventListener("click", () => loadLogHistory(false));
+  $("#downloadLogsButton").addEventListener("click", downloadLogHistory);
+  $("#clearHistoryLogsButton").addEventListener("click", clearPersistentLogs);
+  $("#logHistoryDialog").addEventListener("cancel", (event) => { event.preventDefault(); closeLogHistory(); });
   $("#collapseLogButton").addEventListener("click", () => {
     const collapsed = $("#logPanel").classList.toggle("collapsed");
     $(".workspace").classList.toggle("log-collapsed", collapsed);
   });
 
   $("#refreshPostsButton").addEventListener("click", () => { setPostSelectionMode(false); loadPosts(); });
-  $("#newPostButton").addEventListener("click", () => { setPostSelectionMode(false); $("#newPostDialog").showModal(); });
+  $("#newPostButton").addEventListener("click", () => { setPostSelectionMode(false); $("#newPostForm").reset(); $("#newPostFolderCustomField").classList.add("hidden"); $("#newPostDialog").showModal(); });
+  $("#cancelNewPostButton").addEventListener("click", (event) => { event.preventDefault(); closeNewPostDialog(); });
+  $("#newPostDialog").addEventListener("cancel", (event) => { event.preventDefault(); closeNewPostDialog(); });
   $("#newPostFolder").addEventListener("change", () => {
     const custom = $("#newPostFolder").value === "__new__";
     $("#newPostFolderCustomField").classList.toggle("hidden", !custom);

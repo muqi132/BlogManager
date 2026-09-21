@@ -152,6 +152,7 @@
             <div class="heading-actions"><span class="file-chip">_config.butterfly.yml</span><span class="save-state" id="themeSaveHint">等待加载配置</span><label class="config-search"><svg><use href="#i-search"></use></svg><input type="search" id="themeConfigSearch" placeholder="搜索主题配置"></label><div class="segmented" id="themeModeSwitch" role="group" aria-label="主题配置编辑模式"><button type="button" class="active" data-mode="fields">表单</button><button type="button" data-mode="raw">YAML</button></div><button class="button primary" type="submit" form="themeForm" id="saveThemeButton"><svg><use href="#i-save"></use></svg><span>保存主题配置</span></button></div>
           </div>
           <div class="notice warning hidden" id="themeConfigNotice"><svg><use href="#i-folder"></use></svg><div><strong>未找到 Butterfly 配置</strong><span>未发现主题目录配置文件或根目录覆盖文件。</span></div></div>
+          <div class="notice warning hidden" id="themeConfigWarnings"><svg><use href="#i-info"></use></svg><div><strong>主题配置存在异常项</strong><span id="themeConfigWarningText"></span></div></div>
           <div class="notice info source-notice" id="themeSourceNotice"><svg><use href="#i-code"></use></svg><div><strong>配置合并来源</strong><span id="themeSourceText">正在读取...</span></div></div>
           <form id="themeForm">
             <div class="config-groups" id="themeFields"></div>
@@ -274,7 +275,7 @@
       <section class="log-panel" id="logPanel">
         <header class="log-header">
           <div class="log-heading"><span class="terminal-mark"><svg><use href="#i-terminal"></use></svg></span><div><strong>运行日志</strong><small id="logSubtitle">等待命令</small></div></div>
-          <div class="log-actions"><span class="task-status hidden" id="taskStatus"><span></span><b>运行中</b></span><button class="text-button" id="copyLogButton" type="button">复制</button><button class="text-button" id="clearLogButton" type="button">清空</button><button class="icon-button small collapse-log-button" id="collapseLogButton" type="button" title="折叠日志" aria-label="折叠日志"><svg><use href="#i-chevron"></use></svg></button></div>
+          <div class="log-actions"><span class="task-status hidden" id="taskStatus"><span></span><b>运行中</b></span><button class="text-button" id="historyLogButton" type="button">历史日志</button><button class="text-button" id="copyLogButton" type="button">复制</button><button class="text-button" id="clearLogButton" type="button">清空</button><button class="icon-button small collapse-log-button" id="collapseLogButton" type="button" title="折叠日志" aria-label="折叠日志"><svg><use href="#i-chevron"></use></svg></button></div>
         </header>
         <div class="log-output" id="logOutput" role="log" aria-live="polite"><div class="log-placeholder" id="logPlaceholder"><svg><use href="#i-terminal"></use></svg><span>部署或预览命令的输出会显示在这里</span></div></div>
       </section>
@@ -283,12 +284,20 @@
 
   <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
+  <dialog class="app-dialog log-history-dialog" id="logHistoryDialog">
+    <form method="dialog" class="log-history-form">
+      <div class="log-history-heading"><div><span class="eyebrow">HISTORY</span><h2>历史日志</h2><p>文件日志会自动轮转，最多保留约 5 MB 和 3 个备份。</p></div><button class="icon-button" id="closeLogHistoryButton" type="button" aria-label="关闭历史日志"><svg><use href="#i-x"></use></svg></button></div>
+      <pre class="log-history-content" id="logHistoryContent">正在读取日志...</pre>
+      <div class="log-history-footer"><span id="logHistoryMeta"></span><div class="log-history-actions"><button class="button ghost" id="loadMoreLogsButton" type="button">加载更多</button><button class="button secondary" id="downloadLogsButton" type="button">下载日志</button><button class="button danger-hover" id="clearHistoryLogsButton" type="button">清空日志</button><button class="button primary" id="closeLogHistoryFooterButton" type="button">关闭</button></div></div>
+    </form>
+  </dialog>
+
   <dialog class="app-dialog" id="exitDialog"><form method="dialog"><div class="dialog-icon"><svg><use href="#i-x"></use></svg></div><h2>退出 Blog Manager？</h2><p>正在运行的预览或部署任务也会被停止，然后关闭本地服务。</p><div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button class="button danger" value="confirm" id="confirmExitButton">退出应用</button></div></form></dialog>
 
   <dialog class="app-dialog" id="unsavedDialog"><form method="dialog"><div class="dialog-icon warning-icon"><svg><use href="#i-save"></use></svg></div><h2>有未保存的配置修改</h2><p>继续部署会使用磁盘上已经保存的配置，未保存的表单内容不会生效。</p><div class="dialog-actions"><button class="button secondary" value="cancel">返回保存</button><button class="button primary" value="confirm" id="deployAnywayButton">仍然部署</button></div></form></dialog>
 
   <dialog class="app-dialog" id="newPostDialog">
-    <form method="dialog" id="newPostForm">
+    <form method="dialog" id="newPostForm" novalidate>
       <div class="dialog-icon"><svg><use href="#i-file"></use></svg></div><h2>新建文章</h2><p>将在 source/_posts 中创建 Markdown 文件和 Front Matter。</p>
       <label class="field"><span class="field-label">标题</span><input type="text" id="newPostTitle" placeholder="文章标题" required></label>
       <label class="field"><span class="field-label">文件名 <em>可选</em></span><input type="text" id="newPostFilename" placeholder="默认根据标题生成" autocomplete="off"></label>
@@ -296,7 +305,7 @@
       <label class="field hidden" id="newPostFolderCustomField"><span class="field-label">新文件夹名称</span><input type="text" id="newPostFolderCustom" placeholder="例如：技术/Hexo"></label>
       <label class="field"><span class="field-label">分类 <em>逗号分隔</em></span><input type="text" id="newPostCategories" placeholder="技术, Hexo" autocomplete="off"></label>
       <label class="field"><span class="field-label">标签 <em>逗号分隔</em></span><input type="text" id="newPostTags" placeholder="博客, 前端" autocomplete="off"></label>
-      <div class="dialog-actions"><button class="button secondary" value="cancel">取消</button><button class="button primary" value="confirm" id="confirmNewPostButton">创建文章</button></div>
+      <div class="dialog-actions"><button class="button secondary" type="button" id="cancelNewPostButton">取消</button><button class="button primary" value="confirm" id="confirmNewPostButton">创建文章</button></div>
     </form>
   </dialog>
 

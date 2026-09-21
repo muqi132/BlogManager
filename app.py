@@ -5,6 +5,7 @@ import copy
 import io
 import json
 import locale
+import logging
 import mimetypes
 import os
 import re
@@ -20,6 +21,7 @@ import webbrowser
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -45,6 +47,8 @@ CONFIG_FILE = SETTINGS_DIR / "config.json"
 LEGACY_SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 BROWSER_PROFILE_DIR = SETTINGS_DIR / "browser-profile"
 CLEANUP_REPORT_FILE = SETTINGS_DIR / "last-cleanup.json"
+LOG_DIR = SETTINGS_DIR / "logs"
+LOG_FILE = LOG_DIR / "blogmanager.log"
 SITE_CONFIG_NAME = "_config.yml"
 THEME_CONFIG_NAME = "_config.butterfly.yml"
 THEME_BASE_CONFIG = Path("themes") / "butterfly" / "_config.yml"
@@ -252,6 +256,27 @@ class SettingsStore:
 settings_store = SettingsStore(CONFIG_FILE, LEGACY_SETTINGS_FILE)
 app = Flask(__name__)
 app.json.ensure_ascii = False
+
+
+def configure_application_logging() -> logging.Logger:
+    logger = logging.getLogger("blogmanager")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+LOGGER = configure_application_logging()
 
 def blog_directory() -> Path | None:
     value = str(settings_store.get().get("blog_dir", "") or "").strip()
@@ -543,6 +568,36 @@ def _comment_text(value: Any) -> str:
         if cleaned:
             lines.append(cleaned)
     return "\n".join(lines)
+
+
+def _comment_texts(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        result: list[str] = []
+        for item in value:
+            result.extend(_comment_texts(item))
+        return result
+    text = _comment_text(value)
+    return [text] if text else []
+
+
+def collect_yaml_comments(document: Any, prefix: str = "", inherited: str = "") -> dict[str, str]:
+    result: dict[str, str] = {}
+    if not isinstance(document, Mapping):
+        return result
+    for key, value in document.items():
+        text = str(key)
+        path = f"{prefix}.{text}" if prefix else text
+        own_description = ""
+        if isinstance(document, CommentedMap):
+            own_description = "\n".join(_comment_texts(document.ca.items.get(text))).strip()
+        description = own_description or inherited
+        if description:
+            result[path] = description
+        if isinstance(value, Mapping):
+            result.update(collect_yaml_comments(value, path, description))
+    return result
 
 
 def delete_path(document: CommentedMap, path: str) -> bool:
@@ -1345,6 +1400,7 @@ def run_process(task: Task) -> None:
             task.finish("stopped", None)
             return
         display_command = f"hexo server -p {task.port}" if task.kind == "preview" else task.command
+        LOGGER.info("task start | kind=%s | cwd=%s | command=%s", task.kind, task.cwd, display_command)
         task.emit(f"$ {display_command}", "system")
         task.emit(f"工作目录：{task.cwd}", "muted")
         env = os.environ.copy()
@@ -1373,16 +1429,35 @@ def run_process(task: Task) -> None:
             task.pid = process.pid
             task.condition.notify_all()
         assert process.stdout is not None
+        output_tail: list[str] = []
+        logged_output = 0
         for raw_line in iter(process.stdout.readline, ""):
             task.emit(raw_line)
+            cleaned = str(raw_line).strip()
+            if cleaned:
+                output_tail.append(cleaned)
+                if len(output_tail) > 30:
+                    output_tail.pop(0)
+                if logged_output < 80:
+                    LOGGER.info("command output | kind=%s | %s", task.kind, cleaned)
+                    logged_output += 1
         exit_code = process.wait()
         if task.stop_requested:
+            LOGGER.warning("task stopped | kind=%s | command=%s", task.kind, display_command)
             task.emit("任务已停止。", "warning")
             task.finish("stopped", exit_code)
         elif exit_code == 0:
+            LOGGER.info("task complete | kind=%s | code=0 | command=%s", task.kind, display_command)
             task.emit("命令执行完成。", "success")
             task.finish("success", exit_code)
         else:
+            LOGGER.error(
+                "task failed | kind=%s | code=%s | command=%s | tail=%s",
+                task.kind,
+                exit_code,
+                display_command,
+                " | ".join(output_tail[-10:]),
+            )
             task.emit(f"命令执行失败，退出码：{exit_code}", "error")
             task.finish("failed", exit_code)
     except FileNotFoundError as exc:
@@ -1665,6 +1740,74 @@ def consume_cleanup_report() -> dict[str, Any] | None:
         return None
     return None if report.get("ok") else report
 
+def read_persistent_logs(limit: int = 200, offset: int = 0) -> dict[str, Any]:
+    limit = max(1, min(int(limit), 1000))
+    offset = max(0, int(offset))
+    if not LOG_FILE.exists():
+        return {"lines": [], "total": 0, "offset": 0, "has_more": False}
+    try:
+        lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        raise ApiError(f"读取历史日志失败：{exc}") from exc
+    total = len(lines)
+    end = max(0, total - offset)
+    start = max(0, end - limit)
+    return {
+        "lines": lines[start:end],
+        "total": total,
+        "offset": offset + (end - start),
+        "has_more": start > 0,
+    }
+
+
+def truncate_persistent_logs() -> None:
+    for handler in LOGGER.handlers:
+        if not isinstance(handler, RotatingFileHandler):
+            continue
+        handler.acquire()
+        try:
+            handler.stream.seek(0)
+            handler.stream.truncate(0)
+            handler.flush()
+        finally:
+            handler.release()
+    for index in range(1, 4):
+        try:
+            Path(f"{LOG_FILE}.{index}").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+@app.get("/api/logs")
+def api_logs() -> Response:
+    try:
+        limit = int(request.args.get("limit", "200"))
+    except ValueError:
+        limit = 200
+    try:
+        offset = int(request.args.get("offset", "0"))
+    except ValueError:
+        offset = 0
+    return jsonify(read_persistent_logs(limit, offset))
+
+
+@app.get("/api/logs/download")
+def api_download_logs() -> Response:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if not LOG_FILE.exists():
+        LOG_FILE.touch()
+    return send_file(LOG_FILE, as_attachment=True, download_name="blogmanager.log")
+
+
+@app.delete("/api/logs")
+def api_clear_logs() -> Response:
+    try:
+        truncate_persistent_logs()
+    except OSError as exc:
+        raise ApiError(f"清空历史日志失败：{exc}") from exc
+    return jsonify({"ok": True})
+
+
 @app.get("/api/status")
 def api_status() -> Response:
     settings = settings_store.get()
@@ -1881,14 +2024,27 @@ def api_get_theme_config() -> Response:
         raise ApiError("找不到 Butterfly 主题配置文件。", 404)
     base = load_yaml_file(base_path, allow_missing=True)
     override = load_yaml_file(override_path, allow_missing=True)
+    warnings: list[dict[str, str]] = []
     menu = get_path(effective, "menu", CommentedMap())
     social = get_path(effective, "social", CommentedMap())
     if not isinstance(menu, Mapping):
-        raise ApiError("主题配置中的 menu 必须是 YAML 映射。")
+        warnings.append({
+            "path": "menu",
+            "message": "menu 配置格式异常，当前使用空菜单以确保其他配置仍可正常加载。请检查 YAML 文件。",
+        })
+        menu = CommentedMap()
     if not isinstance(social, Mapping):
-        raise ApiError("主题配置中的 social 必须是 YAML 映射。")
+        warnings.append({
+            "path": "social",
+            "message": "social 配置格式异常，当前使用空社交链接以确保其他配置仍可正常加载。请检查 YAML 文件。",
+        })
+        social = CommentedMap()
     menu_items, menu_is_simple = menu_items_from_mapping(menu)
     social_items, social_is_simple = social_items_from_mapping(social)
+    if any(item["path"] == "menu" for item in warnings):
+        menu_is_simple = True
+    if any(item["path"] == "social" for item in warnings):
+        social_is_simple = True
     return jsonify(
         {
             "base_path": str(base_path),
@@ -1900,6 +2056,8 @@ def api_get_theme_config() -> Response:
             "override_paths": sorted(collect_explicit_paths(override)),
             "raw_yaml": dump_yaml_value(override),
             "effective_raw_yaml": dump_yaml_value(effective),
+            "field_descriptions": collect_yaml_comments(effective),
+            "warnings": warnings,
             "menu_items": menu_items,
             "menu_is_simple": menu_is_simple,
             "social_items": social_items,
@@ -2712,7 +2870,9 @@ def run_task_command(
     cwd: Path,
     display_command: str | None = None,
 ) -> int:
-    task.emit(f"$ {display_command or subprocess.list2cmdline(args)}", "system")
+    display = display_command or subprocess.list2cmdline(args)
+    LOGGER.info("command start | cwd=%s | command=%s", cwd, display)
+    task.emit(f"$ {display}", "system")
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["NO_COLOR"] = "1"
@@ -2739,9 +2899,30 @@ def run_task_command(
         task.pid = process.pid
         task.condition.notify_all()
     assert process.stdout is not None
+    output_tail: list[str] = []
+    logged_output = 0
     for line in iter(process.stdout.readline, ""):
         task.emit(line)
-    return process.wait()
+        cleaned = str(line).strip()
+        if cleaned:
+            output_tail.append(cleaned)
+            if len(output_tail) > 30:
+                output_tail.pop(0)
+            if logged_output < 80:
+                LOGGER.info("command output | command=%s | %s", display, cleaned)
+                logged_output += 1
+    exit_code = process.wait()
+    if exit_code == 0:
+        LOGGER.info("command complete | code=0 | cwd=%s | command=%s", cwd, display)
+    else:
+        LOGGER.error(
+            "command failed | code=%s | cwd=%s | command=%s | tail=%s",
+            exit_code,
+            cwd,
+            display,
+            " | ".join(output_tail[-10:]),
+        )
+    return exit_code
 
 
 def inspect_target_folder(path: Path) -> dict[str, Any]:
@@ -3998,7 +4179,7 @@ def handle_unexpected_error(error: Exception) -> tuple[Response, int]:
         return jsonify({"error": str(error), "details": error.details}), error.status_code
     if isinstance(error, HTTPException):
         return jsonify({"error": error.description, "details": None}), error.code or 500
-    app.logger.exception("Unhandled error")
+    LOGGER.exception("Unhandled request error")
     return jsonify({"error": f"服务器内部错误：{error}", "details": None}), 500
 
 
@@ -4149,6 +4330,7 @@ def open_app_window(url: str) -> None:
             )
             with BROWSER_LOCK:
                 BROWSER_PIDS.append(process.pid)
+            LOGGER.info("browser app window opened | pid=%s | url=%s | browser=%s", process.pid, url, browser)
             return
         except OSError:
             pass
@@ -4187,15 +4369,17 @@ def main() -> int:
         return picker_subprocess_main(args.pick_folder)
     port = find_free_port(args.port)
     url = f"http://127.0.0.1:{port}"
+    LOGGER.info("Blog Manager starting | port=%s | browser=%s", port, not args.no_browser)
     if not args.no_browser:
         threading.Thread(target=open_app_window_when_ready, args=(url,), daemon=True).start()
         threading.Thread(target=start_client_watchdog, daemon=True).start()
     try:
         app.run(host="127.0.0.1", port=port, threaded=True, use_reloader=False, debug=False)
     except KeyboardInterrupt:
-        pass
+        LOGGER.info("Blog Manager interrupted by user")
     finally:
         task_manager.stop_all()
+        LOGGER.info("Blog Manager stopped | port=%s", port)
     return 0
 
 
