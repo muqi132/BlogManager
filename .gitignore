@@ -13,3 +13,4 @@ settings.json
 dist/
 .DS_Store
 Thumbs.db
+push.bat
