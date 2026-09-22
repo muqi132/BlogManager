@@ -1975,6 +1975,7 @@ def api_get_site_config() -> Response:
         {
             "path": str(path),
             "values": plain_value(document),
+            "field_descriptions": collect_yaml_comments(document),
             "raw_yaml": dump_yaml_value(document),
         }
     )
@@ -2056,7 +2057,10 @@ def api_get_theme_config() -> Response:
             "override_paths": sorted(collect_explicit_paths(override)),
             "raw_yaml": dump_yaml_value(override),
             "effective_raw_yaml": dump_yaml_value(effective),
-            "field_descriptions": collect_yaml_comments(effective),
+            "field_descriptions": {
+                **collect_yaml_comments(base),
+                **collect_yaml_comments(override),
+            },
             "warnings": warnings,
             "menu_items": menu_items,
             "menu_is_simple": menu_is_simple,

@@ -43,7 +43,7 @@ const state = {
   previewDependencies: null,
   images: [],
   imageViewer: { relativePath: "", name: "", url: "", size: 0, width: 0, height: 0, scale: 1, rotation: 0, x: 0, y: 0, dragging: false, startX: 0, startY: 0, originX: 0, originY: 0 },
-  editor: { relativePath: "", content: "", original: "", dirty: false, renderTimer: null },
+  editor: { relativePath: "", content: "", original: "", dirty: false, renderTimer: null, composing: false },
   configImage: { kind: "", path: "", selected: "", external: "", images: [], newImages: new Set(), loadToken: 0 },
   site: {
     loaded: false,
@@ -51,6 +51,7 @@ const state = {
     mode: "fields",
     values: {},
     baseValues: {},
+    fieldDescriptions: {},
     overridePaths: new Set(),
     dirtyPaths: new Set(),
     resetPaths: new Set(),
@@ -271,6 +272,31 @@ function flattenConfigValues(value, prefix, output) {
   output.push({ path: prefix, value });
 }
 
+function configMetadataFor(kind, path) {
+  const parts = String(path || "").split(".").filter(Boolean);
+  const metadataRoot = CONFIG_METADATA[kind] || {};
+  const groupMetadata = metadataRoot[parts[0]] || null;
+  const relativePath = parts.length > 1 ? parts.slice(1).join(".") : ".";
+  const fieldMetadata = groupMetadata?.fields?.[relativePath]
+    || groupMetadata?.fields?.[path]
+    || groupMetadata?.fields?.["*"]
+    || null;
+  return { group: groupMetadata, field: fieldMetadata };
+}
+
+function hasChineseText(value) {
+  return /[\u3400-\u9fff]/u.test(String(value || ""));
+}
+
+function resolveConfigDescription(kind, path, fallbackText = "") {
+  const metadata = configMetadataFor(kind, path);
+  const yamlDescription = state[kind]?.fieldDescriptions?.[path] || "";
+  if (metadata.field?.description) return metadata.field.description;
+  if (hasChineseText(yamlDescription)) return yamlDescription;
+  if (hasChineseText(fallbackText)) return fallbackText;
+  return CONFIG_FALLBACK_DESCRIPTION;
+}
+
 function buildDynamicConfigGroups(kind, values) {
   const config = state[kind];
   const staticPaths = new Set();
@@ -292,25 +318,35 @@ function buildDynamicConfigGroups(kind, values) {
     const top = leaf.path.split(".")[0];
     if (!grouped.has(top)) grouped.set(top, []);
     const baseValue = getPath(config.baseValues, leaf.path);
-    const type = inferConfigType(leaf.path, leaf.value, baseValue);
+    const metadata = configMetadataFor(kind, leaf.path);
+    const fieldOptions = Array.isArray(metadata.field?.options) ? metadata.field.options : [];
+    const type = fieldOptions.length ? "select" : inferConfigType(leaf.path, leaf.value, baseValue);
+    const hint = resolveConfigDescription(kind, leaf.path);
     grouped.get(top).push({
       path: leaf.path,
-      label: humanizeConfigKey(leaf.path.split(".").pop()),
+      label: metadata.field?.label || humanizeConfigKey(leaf.path.split(".").pop()),
       type,
-      imagePicker: type === "image",
-      hint: config.fieldDescriptions?.[leaf.path] || "暂无说明，请参考主题文档。",
-      title: config.fieldDescriptions?.[leaf.path] || "",
+      options: fieldOptions,
+      imagePicker: metadata.field?.type === "image" || type === "image",
+      hint,
+      title: hint,
       dynamic: true,
       default: baseValue,
     });
   }
-  return Array.from(grouped.entries()).sort(([a], [b]) => a.localeCompare(b, "zh-CN")).map(([top, fields]) => ({
-    id: `dynamic-${kind}-${top}`,
-    title: `其他配置 · ${humanizeConfigKey(top)}`,
-    description: "由有效 YAML 结构自动扫描生成，未在常用分类中重复显示。",
-    dynamic: true,
-    fields: fields.sort((a, b) => a.path.localeCompare(b.path, "zh-CN")),
-  }));
+  return Array.from(grouped.entries())
+    .map(([top, fields]) => {
+      const metadata = configMetadataFor(kind, top);
+      return {
+        id: `dynamic-${kind}-${top}`,
+        title: metadata.group?.title || `高级配置 · ${humanizeConfigKey(top)}`,
+        description: metadata.group?.description || CONFIG_FALLBACK_DESCRIPTION,
+        order: metadata.group?.order ?? 999,
+        dynamic: true,
+        fields: fields.sort((a, b) => a.path.localeCompare(b.path, "zh-CN")),
+      };
+    })
+    .sort((left, right) => left.order - right.order || left.title.localeCompare(right.title, "zh-CN"));
 }
 
 function rebuildConfigGroups(kind) {
@@ -576,19 +612,21 @@ function renderConfigGroups(container, groups, values, kind) {
       const cell = document.createElement("div");
       cell.className = `setting-field ${field.span === 2 ? "span-2" : ""} ${field.type === "boolean" ? "boolean-field" : ""}`.trim();
       cell.dataset.configField = field.path;
+      const metadata = configMetadataFor(kind, field.path);
+      const displayHint = field.hint || metadata.field?.description || group.description || resolveConfigDescription(kind, field.path);
       const textWrap = document.createElement("div");
       const label = document.createElement("label");
       label.className = "setting-label";
-      label.textContent = field.label;
+      label.textContent = metadata.field?.label || field.label;
       const pathLabel = document.createElement("span");
       pathLabel.className = "setting-path";
       pathLabel.textContent = field.path;
       textWrap.append(label, pathLabel);
-      if (field.hint) {
+      if (displayHint) {
         const hint = document.createElement("small");
         hint.className = `setting-hint${field.dynamic ? " clamped" : ""}`;
-        hint.textContent = field.hint;
-        hint.title = field.title || field.hint;
+        hint.textContent = displayHint;
+        hint.title = field.title || displayHint;
         textWrap.append(hint);
       }
       const defaultValue = field.default !== undefined ? field.default : getPath(state[kind].baseValues, field.path);
@@ -709,6 +747,7 @@ async function loadSiteConfig(options = {}) {
     const data = await api("/api/site-config", { cache: "no-store" });
     state.site.values = data.values || {};
     state.site.baseValues = data.base_values || {};
+    state.site.fieldDescriptions = data.field_descriptions || {};
     state.site.overridePaths = new Set(data.override_paths || []);
     state.site.loaded = true;
     state.site.rawDirty = false;
@@ -2112,6 +2151,7 @@ async function renderWithMathJax(html, maths) {
 }
 
 function renderMarkdownPreview() {
+  if (state.editor.composing) return;
   const preview = $("#markdownPreview");
   const source = stripFrontMatter($("#markdownSource").value);
   const protectedSource = protectMath(source);
@@ -2152,7 +2192,20 @@ function renderMarkdownPreview() {
 
 function scheduleMarkdownPreview() {
   clearTimeout(state.editor.renderTimer);
-  state.editor.renderTimer = setTimeout(renderMarkdownPreview, 140);
+  if (state.editor.composing) return;
+  state.editor.renderTimer = setTimeout(renderMarkdownPreview, 300);
+}
+
+function refreshMarkdownEditorView() {
+  const source = $("#markdownSource");
+  state.editor.content = source.value;
+  state.editor.dirty = state.editor.content !== state.editor.original;
+  $("#markdownStatus").textContent = state.editor.dirty ? "未保存" : "已加载";
+  $("#markdownStatus").className = `markdown-status ${state.editor.dirty ? "dirty" : ""}`;
+  $("#markdownHighlight").innerHTML = highlightMarkdown(state.editor.content);
+  updateMarkdownLineNumbers();
+  syncMarkdownScroll();
+  scheduleMarkdownPreview();
 }
 
 function wrapMarkdownSelection(prefix, suffix = prefix) {
@@ -2161,6 +2214,8 @@ function wrapMarkdownSelection(prefix, suffix = prefix) {
   const end = input.selectionEnd;
   const selected = input.value.slice(start, end);
   input.setRangeText(`${prefix}${selected}${suffix}`, start, end, "end");
+  if (start === end) input.setSelectionRange(start + prefix.length, start + prefix.length);
+  else input.setSelectionRange(start + prefix.length, start + prefix.length + selected.length);
   input.dispatchEvent(new Event("input", { bubbles: true }));
 }
 async function deletePost(post) {
@@ -3654,13 +3709,19 @@ function bindEvents() {
     state.editor.dirty = state.editor.content !== state.editor.original;
     $("#markdownStatus").textContent = state.editor.dirty ? "未保存" : "已加载";
     $("#markdownStatus").className = `markdown-status ${state.editor.dirty ? "dirty" : ""}`;
-    $("#markdownHighlight").innerHTML = highlightMarkdown(state.editor.content);
-    updateMarkdownLineNumbers();
-    syncMarkdownScroll();
-    scheduleMarkdownPreview();
+    if (!state.editor.composing) refreshMarkdownEditorView();
+  });
+  $("#markdownSource").addEventListener("compositionstart", () => {
+    state.editor.composing = true;
+    clearTimeout(state.editor.renderTimer);
+  });
+  $("#markdownSource").addEventListener("compositionend", () => {
+    state.editor.composing = false;
+    requestAnimationFrame(refreshMarkdownEditorView);
   });
   $("#markdownSource").addEventListener("scroll", syncMarkdownScroll);
   $("#markdownSource").addEventListener("keydown", (event) => {
+    if (event.isComposing || state.editor.composing) return;
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") { event.preventDefault(); wrapMarkdownSelection("**"); }
     else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "i") { event.preventDefault(); wrapMarkdownSelection("*"); }
     else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") { event.preventDefault(); wrapMarkdownSelection("[", "](https://)"); }
