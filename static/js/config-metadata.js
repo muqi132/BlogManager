@@ -22,6 +22,17 @@
   });
 
   const site = {
+    markdown: group("Markdown 渲染", "控制 hexo-renderer-markdown-it 的 Markdown 解析、语法扩展和公式解析。", {
+      preset: ["解析预设", "选择 markdown-it 的解析预设：default、commonmark 或 zero。", options(["default", "默认 GFM 风格"], ["commonmark", "严格 CommonMark"], ["zero", "全部规则关闭"])],
+      "render.html": ["允许 HTML", "允许 Markdown 中的原始 HTML 标签直接输出。"],
+      "render.xhtmlOut": ["XHTML 输出", "生成完全符合 XHTML 规范的标签。"],
+      "render.langPrefix": ["语言类名前缀", "代码块语言对应的 CSS 类名前缀。"],
+      "render.breaks": ["启用换行", "把普通换行转换为 <br>。"],
+      "render.linkify": ["自动链接", "自动把文本中的 URL 转换为链接。"],
+      "render.typographer": ["启用排版替换", "启用引号、破折号等常见排版符号替换。"],
+      "render.quotes": ["引号样式", "设置 typographer 使用的左右单双引号字符。"],
+      plugins: ["Markdown 插件", "列出需要加载的 markdown-it 插件包名，每行一个。"],
+    }, 200),
     source_dir: group("源文件目录", "Hexo 内容源目录。", {
       ".": ["源文件目录", "保存文章、页面和图片等源文件的目录，通常保持为 source。"],
     }, 650),

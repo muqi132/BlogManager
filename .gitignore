@@ -8,6 +8,8 @@ config.json
 settings.json
 *.blogmanager.bak
 *.blogmanager.tmp
+.blogmanager-trash/
+package-lock.json
 .e2e*/
 .testblog/
 dist/

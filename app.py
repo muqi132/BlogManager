@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import io
 import json
 import locale
@@ -871,8 +872,6 @@ def list_files(root: Path, extensions: set[str]) -> list[Path]:
     return files
 
 
-from pathlib import Path
-
 def read_post_frontmatter(path: Path) -> dict[str, Any]:
     try:
         text = path.read_text(encoding="utf-8-sig")
@@ -959,7 +958,11 @@ def frontmatter_properties(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
         properties.append({"name": str(key), "type": value_type, "value": display_value})
     return properties
 
-def coerce_frontmatter_value(value_type: str, value: Any) -> Any:
+def coerce_frontmatter_value(
+    value_type: str,
+    value: Any,
+    original_value: Any = None,
+) -> Any:
     kind = (value_type or "text").strip().lower()
     if kind == "array":
         items = value if isinstance(value, list) else re.split(r"[\n,，]+", str(value or ""))
@@ -983,24 +986,42 @@ def coerce_frontmatter_value(value_type: str, value: Any) -> Any:
             raise ApiError(f"YAML 属性解析失败：{exc}") from exc
         return plain_value(parsed) if parsed is not None else ""
     if kind == "date":
-        text = str(value or "").strip()
-        matched = re.match(
-            r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?",
-            text,
-        )
-        if matched:
-            normalized_date = f"{matched.group(1)}-{int(matched.group(2)):02d}-{int(matched.group(3)):02d}"
-            if not matched.group(4):
-                return normalized_date
-            return (
-                f"{normalized_date} {int(matched.group(4)):02d}:{int(matched.group(5)):02d}:"
-                f"{int(matched.group(6) or 0):02d}"
-            )
-        return text
+        return merge_date_time(value, original_value)
     return str(value or "").strip()
 
 
-def frontmatter_metadata_from_properties(properties: Any) -> CommentedMap:
+def merge_date_time(value: Any, original_value: Any) -> str:
+    """属性弹窗只显示和回传年月日。输入不含时间时保留原值的时分秒，避免静默丢时间。"""
+    matched = re.match(
+        r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?",
+        str(value or "").strip(),
+    )
+    if not matched:
+        # 用户手动填写了无法识别的日期，保持原样交给上层处理。
+        return str(value or "").strip()
+    normalized_date = f"{matched.group(1)}-{int(matched.group(2)):02d}-{int(matched.group(3)):02d}"
+    if matched.group(4):
+        return (
+            f"{normalized_date} {int(matched.group(4)):02d}:{int(matched.group(5)):02d}:"
+            f"{int(matched.group(6) or 0):02d}"
+        )
+    # 输入只有日期：若原值带时间，沿用原时间，保持原有排序语义。
+    original = re.match(
+        r"^\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?",
+        str(original_value or "").strip(),
+    )
+    if original and str(original.group(1)) == matched.group(1):
+        return (
+            f"{normalized_date} {int(original.group(4)):02d}:{int(original.group(5)):02d}:"
+            f"{int(original.group(6) or 0):02d}"
+        )
+    return normalized_date
+
+
+def frontmatter_metadata_from_properties(
+    properties: Any,
+    original_metadata: Mapping[str, Any] | None = None,
+) -> CommentedMap:
     if not isinstance(properties, list):
         raise ApiError("frontmatter 必须是属性数组。")
     metadata = CommentedMap()
@@ -1013,7 +1034,8 @@ def frontmatter_metadata_from_properties(properties: Any) -> CommentedMap:
         if name in metadata:
             raise ApiError(f"属性名重复：{name}")
         value_type = normalize_text(item.get("type"), "属性类型") or "text"
-        metadata[name] = coerce_frontmatter_value(value_type, item.get("value"))
+        original_value = original_metadata.get(name) if isinstance(original_metadata, Mapping) else None
+        metadata[name] = coerce_frontmatter_value(value_type, item.get("value"), original_value)
     return metadata
 
 def frontmatter_value_present(value: Any) -> bool:
@@ -1151,7 +1173,7 @@ def auto_complete_post_frontmatter(root: Path) -> dict[str, list[dict[str, str]]
                 shutil.copy2(path, backup)
             temp_path.write_text(new_content, encoding="utf-8", newline="\n")
             os.replace(temp_path, path)
-            app.logger.info("已为 %s 自动补全 front-matter", relative)
+            LOGGER.info("已为 %s 自动补全 front-matter", relative)
             repaired.append({"relative_path": relative})
         except OSError as exc:
             try:
@@ -1192,6 +1214,157 @@ def open_with_default_app(path: Path) -> None:
         subprocess.Popen(["open", str(path)])
     else:
         subprocess.Popen(["xdg-open", str(path)])
+
+
+TRASH_DIR_NAME = ".blogmanager-trash"
+TRASH_RETENTION_DAYS = 30
+TRASH_MAX_BYTES = 100 * 1024 * 1024
+
+
+def blog_trash_dir() -> Path:
+    """回收站放在博客根目录，而不是 source/ 下。
+
+    放在 source/ 下虽然会被 Hexo 的隐藏文件规则排除（isHiddenFile 匹配 `(^|/)[_.]`），
+    但仍会污染源目录、被编辑器索引，而且一旦用户在 _config.yml 里配置了 include，
+    就会被 hexo generate 复制到 public。放到博客根目录可彻底避免这些情况。
+    """
+    return require_blog_directory() / TRASH_DIR_NAME
+
+
+def trash_dir_size(directory: Path) -> int:
+    total = 0
+    for item in directory.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def trash_dir_count(directory: Path) -> int:
+    try:
+        return sum(1 for item in directory.iterdir() if item.is_file())
+    except OSError:
+        return 0
+
+
+def _trash_remove(target: Path) -> bool:
+    try:
+        target.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def migrate_legacy_trash(root: Path) -> dict[str, int]:
+    """把旧版位于 source/_posts/.blogmanager-trash 的回收站搬到博客根目录。"""
+    legacy = root / TRASH_DIR_NAME
+    new_dir = blog_trash_dir()
+    if legacy == new_dir or not legacy.is_dir():
+        return {"moved": 0, "failed": 0}
+
+    new_dir.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    failed = 0
+    for item in sorted(legacy.iterdir()):
+        if not item.is_file():
+            continue
+        destination = new_dir / item.name
+        counter = 1
+        while destination.exists():
+            destination = new_dir / f"{item.stem}-{counter}{item.suffix}"
+            counter += 1
+        try:
+            shutil.move(str(item), str(destination))
+            moved += 1
+        except OSError:
+            failed += 1
+    if not failed and not any(legacy.iterdir()):
+        shutil.rmtree(legacy, ignore_errors=True)
+    return {"moved": moved, "failed": failed}
+
+
+def cleanup_trash(directory: Path | None = None) -> dict[str, Any]:
+    """按保留天数与总量上限清理回收站，返回清理统计。"""
+    directory = directory or blog_trash_dir()
+    report: dict[str, Any] = {
+        "path": str(directory),
+        "removed_expired": 0,
+        "removed_oversized": 0,
+        "removed": 0,
+        "failed": 0,
+        "bytes_before": 0,
+        "bytes_after": 0,
+    }
+    if not directory.is_dir():
+        return report
+
+    deadline = datetime.now().timestamp() - TRASH_RETENTION_DAYS * 86400
+    for item in sorted(directory.rglob("*")):
+        try:
+            if not item.is_file() or item.stat().st_mtime >= deadline:
+                continue
+        except OSError:
+            continue
+        if _trash_remove(item):
+            report["removed_expired"] += 1
+        else:
+            report["failed"] += 1
+    report["bytes_before"] = trash_dir_size(directory)
+
+    if report["bytes_before"] > TRASH_MAX_BYTES:
+        entries: list[tuple[float, int, Path]] = []
+        for item in directory.rglob("*"):
+            try:
+                if item.is_file():
+                    stat = item.stat()
+                    entries.append((stat.st_mtime, stat.st_size, item))
+            except OSError:
+                continue
+        entries.sort(key=lambda entry: entry[0])
+        remaining = report["bytes_before"]
+        for _mtime, size, item in entries:
+            if remaining <= TRASH_MAX_BYTES:
+                break
+            if _trash_remove(item):
+                report["removed_oversized"] += 1
+                remaining -= size
+            else:
+                report["failed"] += 1
+        report["bytes_after"] = trash_dir_size(directory)
+    else:
+        report["bytes_after"] = report["bytes_before"]
+    report["removed"] = report["removed_expired"] + report["removed_oversized"]
+    return report
+
+
+def move_post_to_trash(root: Path, path: Path) -> tuple[Path, dict[str, Any]]:
+    """把文章移入博客根目录下的回收站，并顺带执行容量与时效清理。"""
+    trash = blog_trash_dir()
+    trash.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = trash / f"{stamp}-{path.name}"
+    counter = 1
+    while target.exists():
+        target = trash / f"{stamp}-{counter}-{path.name}"
+        counter += 1
+    try:
+        shutil.move(str(path), str(target))
+    except OSError as exc:
+        raise ApiError(f"无法移动文章到回收目录：{exc}") from exc
+
+    # 与回收站同级的 .md 备份/临时文件已无意义，避免继续堆在 source/_posts 下。
+    for suffix in (".blogmanager.bak", ".blogmanager.tmp"):
+        stale = path.with_suffix(path.suffix + suffix)
+        try:
+            if stale.is_file():
+                stale.unlink()
+        except OSError:
+            pass
+    return target, cleanup_trash(trash)
 
 
 def safe_filename(title: str, filename: str = "") -> str:
@@ -2532,7 +2705,7 @@ def api_repair_post_frontmatter() -> Response:
     result = batch_repair_post_frontmatter(root, relative_paths)
     for item in result["results"]:
         if item["changed"]:
-            app.logger.info("已检查并修复 %s：%s", item["relative_path"], "、".join(item["changes"]))
+            LOGGER.info("已检查并修复 %s：%s", item["relative_path"], "、".join(item["changes"]))
     return jsonify(result)
 
 
@@ -2573,7 +2746,10 @@ def api_update_post_frontmatter() -> Response:
         raise ApiError(info["error"] or "front-matter YAML 格式错误，请先修复原文件。", 409)
     if info.get("error") and not info.get("text"):
         raise ApiError(str(info["error"]), 409)
-    metadata = frontmatter_metadata_from_properties(payload.get("properties"))
+    metadata = frontmatter_metadata_from_properties(
+        payload.get("properties"),
+        info["metadata"] if info["valid"] else None,
+    )
     yaml = new_round_trip_yaml()
     stream = io.StringIO()
     yaml.dump(metadata, stream)
@@ -2705,18 +2881,42 @@ def api_delete_post() -> Response:
     path = ensure_child_path(root, relative)
     if not path.exists() or not path.is_file():
         raise ApiError("文章不存在。", 404)
-    trash = root / ".blogmanager-trash"
-    trash.mkdir(parents=True, exist_ok=True)
-    target = trash / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{path.name}"
-    counter = 1
-    while target.exists():
-        target = trash / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{counter}-{path.name}"
-        counter += 1
+    migrate_legacy_trash(root)
+    target, cleanup = move_post_to_trash(root, path)
     try:
-        shutil.move(str(path), str(target))
-    except OSError as exc:
-        raise ApiError(f"无法移动文章到回收目录：{exc}") from exc
-    return jsonify({"ok": True, "moved_to": target.relative_to(root).as_posix()})
+        relative_target = target.relative_to(require_blog_directory()).as_posix()
+    except ValueError:
+        relative_target = target.name
+    return jsonify(
+        {
+            "ok": True,
+            "moved_to": relative_target,
+            "trash_cleanup": cleanup,
+        }
+    )
+
+
+@app.post("/api/posts/trash/cleanup")
+def api_cleanup_trash() -> Response:
+    root = require_blog_directory() / "source" / "_posts"
+    migrate = migrate_legacy_trash(root)
+    cleanup = cleanup_trash()
+    return jsonify({"ok": True, "migration": migrate, "cleanup": cleanup})
+
+
+@app.get("/api/posts/trash")
+def api_trash_status() -> Response:
+    trash = blog_trash_dir()
+    return jsonify(
+        {
+            "path": str(trash),
+            "exists": trash.is_dir(),
+            "count": trash_dir_count(trash),
+            "bytes": trash_dir_size(trash),
+            "retention_days": TRASH_RETENTION_DAYS,
+            "max_bytes": TRASH_MAX_BYTES,
+        }
+    )
 
 
 def safe_image_filename(

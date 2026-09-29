@@ -1,6 +1,7 @@
 "use strict";
 
 const SCHEMA = window.CONFIG_SCHEMA;
+const CONFIG_FALLBACK_DESCRIPTION = window.CONFIG_METADATA?.fallbackDescription || "暂无说明，建议参考官方文档";
 const THEME_SOURCE_URLS = {
   github: "https://github.com/jerryc127/hexo-theme-butterfly.git",
   gitee: "https://gitee.com/jerryc127/hexo-theme-butterfly.git",
@@ -2230,13 +2231,42 @@ function wrapMarkdownSelection(prefix, suffix = prefix) {
   input.dispatchEvent(new Event("input", { bubbles: true }));
 }
 async function deletePost(post) {
-  if (!window.confirm(`确定删除“${post.title}”吗？文章会移动到 .blogmanager-trash，而不是永久删除。`)) return;
+  if (!window.confirm(`确定删除“${post.title}”吗？文章会移动到博客根目录的 .blogmanager-trash，而不是永久删除。`)) return;
   try {
-    await api("/api/posts", { method: "DELETE", body: JSON.stringify({ relative_path: post.relative_path }) });
-    toast("文章已移入回收目录", post.relative_path, "success");
+    const data = await api("/api/posts", { method: "DELETE", body: JSON.stringify({ relative_path: post.relative_path }) });
+    toast("文章已移入回收目录", data.moved_to || post.relative_path, "success");
+    const cleanup = data.trash_cleanup;
+    if (cleanup && cleanup.removed) {
+      toast("回收站已自动清理", `清理 ${cleanup.removed} 个过期或超量文件，剩余 ${formatBytes(cleanup.bytes_after || 0)}。`, "info", 6000);
+    }
     await loadPosts({ quiet: true });
   } catch (error) {
     toast("删除失败", error.message, "error");
+  }
+}
+
+async function cleanPostTrash() {
+  const button = $("#cleanTrashButton");
+  try {
+    const status = await api("/api/posts/trash", { cache: "no-store" });
+    if (!status.exists || !status.count) {
+      toast("回收站是空的", "没有需要清理的备份文件。", "info");
+      return;
+    }
+    const size = formatBytes(status.bytes || 0);
+    if (!window.confirm(`确定清空回收站吗？将删除 ${status.count} 个文件（${size}），此操作不可恢复。`)) return;
+    setButtonBusy(button, true, "清理中...");
+    const result = await api("/api/posts/trash/cleanup", { method: "POST", body: "{}" });
+    const cleanup = result.cleanup || {};
+    const migration = result.migration || {};
+    const parts = [`删除 ${cleanup.removed || 0} 个文件`];
+    if (cleanup.failed) parts.push(`${cleanup.failed} 个失败`);
+    if (migration.moved) parts.push(`迁移旧回收站 ${migration.moved} 个文件`);
+    toast("回收站已清理", `${parts.join("，")}。保留上限 ${status.retention_days} 天 / ${formatBytes(status.max_bytes || 0)}。`, cleanup.failed ? "warning" : "success", 7000);
+  } catch (error) {
+    toast("无法清理回收站", error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
   }
 }
 
@@ -3666,6 +3696,7 @@ function bindEvents() {
   $("#postSearch").addEventListener("input", renderPosts);
   $("#checkFrontmatterButton").addEventListener("click", handleFrontmatterCheck);
   $("#clearPostSelectionButton").addEventListener("click", clearPostSelection);
+  $("#cleanTrashButton").addEventListener("click", cleanPostTrash);
   $("#postSelectAll").addEventListener("change", () => {
     const visible = state.postSelection.visiblePaths || [];
     if ($("#postSelectAll").checked) visible.forEach((path) => state.postSelection.selected.add(path));
