@@ -1036,3 +1036,45 @@ body, .sidebar, .workspace, .topbar, .settings-card, .action-card, .config-group
 #previewDependencyIssues { max-height: 220px; overflow: auto; }
 #previewDependencyIssues .source-status { align-items: flex-start; text-align: left; }
 #previewDependencyIssues .source-status span { min-width: 0; overflow-wrap: anywhere; }
+
+/* ===== 拖拽上传 ===== */
+.drop-zone { position: relative; border: 1px dashed transparent; border-radius: var(--radius); transition: border-color 150ms ease, background-color 150ms ease, box-shadow 150ms ease; }
+.drop-zone.drop-active { border-color: var(--accent); background: var(--accent-soft); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent); }
+.image-grid:empty { display: none; }
+#imageDropZone { min-height: 180px; padding: 4px; }
+#imageDropZone.drop-active { padding: 4px; }
+.cover-library.drop-zone { padding: 4px 22px 18px; }
+.cover-library.drop-zone.drop-active { background: var(--accent-soft); }
+.cover-library-inner { display: block; }
+
+.drop-overlay {
+  position: absolute; inset: 0; z-index: 5;
+  display: none; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+  border-radius: var(--radius); padding: 20px; text-align: center;
+  color: var(--accent-strong);
+  background: color-mix(in srgb, var(--accent-soft) 88%, var(--panel));
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+}
+.drop-zone.drop-active .drop-overlay { display: flex; }
+.drop-overlay svg { width: 30px; height: 30px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.drop-overlay strong { font-size: 13px; }
+.drop-overlay span { max-width: 320px; color: var(--text-soft); font-size: 11px; line-height: 1.6; }
+.drop-overlay.compact { gap: 4px; padding: 12px; }
+.drop-overlay.compact svg { width: 24px; height: 24px; }
+.drop-overlay.compact strong { font-size: 12px; }
+
+[data-theme="dark"] .drop-overlay { color: var(--accent); background: color-mix(in srgb, var(--accent-soft) 82%, var(--panel)); }
+/* 拖拽文件期间全局提示“可放置”，避免只在落区上才有反馈 */
+body.drop-in-progress, body.drop-in-progress * { cursor: copy !important; }
+
+.drop-progress {
+  position: absolute; inset: 0; z-index: 6;
+  display: flex; align-items: center; justify-content: center; gap: 9px;
+  border-radius: var(--radius);
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  backdrop-filter: blur(3px);
+  font-size: 12px;
+}
+.drop-progress svg { width: 17px; height: 17px; stroke: var(--accent); fill: none; stroke-width: 1.7; stroke-linecap: round; }

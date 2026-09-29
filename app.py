@@ -33,7 +33,7 @@ from flask import Flask, Response, jsonify, render_template, request, send_file
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.scalarstring import LiteralScalarString, SingleQuotedScalarString
-from werkzeug.exceptions import HTTPException
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -69,6 +69,7 @@ FRONT_MATTER_RE = re.compile(r"^---\s*\r?\n(.*?)\r?\n---\s*(?:\r?\n|$)", re.DOTA
 POST_EXTENSIONS = {".md", ".markdown"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif", ".ico"}
 COVER_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+MAX_IMAGE_UPLOAD_MB = 20
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 BROWSER_PIDS: list[int] = []
 BROWSER_LOCK = threading.RLock()
@@ -2933,18 +2934,93 @@ def safe_image_filename(
     return f"{stem}{suffix}"
 
 
-def unique_image_target(root: Path, filename: str) -> Path:
+def unique_image_target(root: Path, filename: str, reserved: set[str] | None = None) -> Path:
+    """返回不冲突的目标路径；reserved 用于同一批上传内互相避让。"""
+    taken = reserved if reserved is not None else set()
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
     candidate = root / filename
-    if not candidate.exists():
+    if not candidate.exists() and filename.casefold() not in taken:
         return candidate
-    stem = candidate.stem
-    suffix = candidate.suffix
     index = 1
     while True:
-        candidate = root / f"{stem}-{index}{suffix}"
-        if not candidate.exists():
+        name = f"{stem}-{index}{suffix}"
+        candidate = root / name
+        if not candidate.exists() and name.casefold() not in taken:
             return candidate
         index += 1
+
+
+def max_image_upload_bytes() -> int:
+    """单张图片大小上限，可用 BLOG_MANAGER_MAX_IMAGE_MB 覆盖（默认 20MB）。"""
+    raw = os.environ.get("BLOG_MANAGER_MAX_IMAGE_MB", "").strip()
+    try:
+        megabytes = int(raw)
+    except ValueError:
+        megabytes = MAX_IMAGE_UPLOAD_MB
+    if megabytes <= 0:
+        megabytes = MAX_IMAGE_UPLOAD_MB
+    return megabytes * 1024 * 1024
+
+
+def allowed_image_extensions(scope: str) -> set[str]:
+    """config/all 允许全部图片格式；其余（封面）只允许位图封面格式。"""
+    return IMAGE_EXTENSIONS if scope in {"config", "all"} else COVER_IMAGE_EXTENSIONS
+
+
+def image_format_labels(allowed: set[str]) -> str:
+    return "、".join(sorted(item.lstrip(".").upper() for item in allowed))
+
+
+def safe_image_filename_ci(filename: str, allowed: set[str]) -> str:
+    """与 safe_image_filename 相同的规则，但扩展名大小写不敏感（拖拽常见 .JPG）。"""
+    raw = Path(str(filename or "")).name
+    suffix = Path(raw).suffix.lower()
+    if suffix not in allowed:
+        raise ApiError(f"只支持 {image_format_labels(allowed)} 图片。", 415)
+    stem = re.sub(r'[\\/:*?"<>|]+', "-", Path(raw).stem).strip(" .") or "image"
+    return f"{stem}{suffix}"
+
+
+def save_uploaded_image(root: Path, upload: Any, allowed: set[str], reserved: set[str]) -> dict[str, Any]:
+    """校验并原子写入单张图片，返回逐文件结果（失败不抛异常，交由调用方汇总）。"""
+    original_name = str(getattr(upload, "filename", "") or "").strip()
+    label = Path(original_name).name or "未命名文件"
+    try:
+        filename = safe_image_filename_ci(original_name, allowed)
+    except ApiError as exc:
+        return {"name": label, "ok": False, "error": exc.message if hasattr(exc, "message") else str(exc)}
+
+    limit = max_image_upload_bytes()
+    limit_mb = max(1, limit // (1024 * 1024))
+    try:
+        upload.stream.seek(0)
+        data = upload.stream.read(limit + 1)
+    except OSError as exc:
+        return {"name": label, "ok": False, "error": f"读取上传文件失败：{exc}"}
+    size = len(data)
+    if size > limit:
+        return {
+            "name": label,
+            "ok": False,
+            "error": f"超过单张 {limit_mb}MB 上限，请压缩后再上传。",
+        }
+    if not size:
+        return {"name": label, "ok": False, "error": "文件内容为空。"}
+
+    target = unique_image_target(root, filename, reserved)
+    temp_path = target.with_suffix(target.suffix + ".blogmanager.tmp")
+    try:
+        temp_path.write_bytes(data)
+        os.replace(temp_path, target)
+    except OSError as exc:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return {"name": label, "ok": False, "error": f"写入失败，请检查 source/img 是否可写：{exc}"}
+    reserved.add(target.name.casefold())
+    return {"name": label, "ok": True, "image": image_payload(target, root)}
 
 
 def image_payload(path: Path, root: Path) -> dict[str, Any]:
@@ -2972,20 +3048,57 @@ def api_images() -> Response:
 
 @app.post("/api/images/upload")
 def api_upload_image() -> Response:
+    """上传图片。兼容两种调用：file（单文件，原有行为）与 files（多文件，拖拽上传）。"""
     root = require_blog_directory() / "source" / "img"
     root.mkdir(parents=True, exist_ok=True)
-    upload = request.files.get("file")
-    if upload is None or not upload.filename:
-        raise ApiError("请选择要上传的图片文件。")
     scope = str(request.form.get("scope", "cover") or "cover").strip().lower()
-    allowed_extensions = IMAGE_EXTENSIONS if scope in {"config", "all"} else COVER_IMAGE_EXTENSIONS
-    filename = safe_image_filename(upload.filename, allowed_extensions)
-    target = unique_image_target(root, filename)
-    try:
-        upload.save(target)
-    except OSError as exc:
-        raise ApiError(f"保存上传图片失败：{exc}") from exc
-    return jsonify({"ok": True, "image": image_payload(target, root)}), 201
+    allowed = allowed_image_extensions(scope)
+
+    uploads = [item for item in request.files.getlist("files") if item and item.filename]
+    batch = True
+    if not uploads:
+        single = request.files.get("file")
+        if single is not None and single.filename:
+            uploads = [single]
+            batch = False
+    if not uploads:
+        raise ApiError("请选择要上传的图片文件。")
+
+    reserved: set[str] = set()
+    results = [save_uploaded_image(root, upload, allowed, reserved) for upload in uploads]
+    succeeded = [item for item in results if item["ok"]]
+    failed = [item for item in results if not item["ok"]]
+    limit_mb = max_image_upload_bytes() // (1024 * 1024)
+    summary = {
+        "ok": bool(succeeded),
+        "total": len(results),
+        "succeeded": len(succeeded),
+        "failed": len(failed),
+        "results": results,
+        "scope": scope,
+        "max_mb": limit_mb,
+    }
+
+    if batch:
+        summary["images"] = [item["image"] for item in succeeded]
+        if not succeeded:
+            detail = "；".join(f"{item['name']}：{item['error']}" for item in failed[:5])
+            raise ApiError(
+                f"上传失败：{detail}",
+                400,
+                {**summary, "upload_failed": True},
+            )
+        if failed:
+            summary["message"] = f"{len(succeeded)} 张成功，{len(failed)} 张失败"
+        else:
+            summary["message"] = f"已成功上传 {len(succeeded)} 张图片"
+        return jsonify(summary), 201
+
+    # 单文件路径：保持原有返回结构，避免破坏既有调用
+    result = results[0]
+    if not result["ok"]:
+        raise ApiError(result["error"], 400, {"upload_failed": True})
+    return jsonify({"ok": True, "image": result["image"]}), 201
 
 
 @app.post("/api/images/from-url")
@@ -4476,6 +4589,20 @@ def api_exit_app() -> Response:
 @app.errorhandler(ApiError)
 def handle_api_error(error: ApiError) -> tuple[Response, int]:
     return jsonify({"error": str(error), "details": error.details}), error.status_code
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_payload_too_large(error: RequestEntityTooLarge) -> tuple[Response, int]:
+    limit_mb = max_image_upload_bytes() // (1024 * 1024)
+    return (
+        jsonify(
+            {
+                "error": f"一次上传的内容过大。单张图片上限 {limit_mb}MB，请分批拖入或先压缩图片。",
+                "details": {"payload_too_large": True, "max_mb": limit_mb},
+            }
+        ),
+        413,
+    )
 
 
 @app.errorhandler(Exception)

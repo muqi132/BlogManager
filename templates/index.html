@@ -232,16 +232,26 @@
               <p>预览 source/img 中的图片，并快速在文件资源管理器中打开所在目录。</p>
             </div>
             <div class="heading-actions">
+              <button class="button secondary" id="uploadImagesButton" type="button"><svg><use href="#i-upload"></use></svg><span>上传图片</span></button>
               <button class="button secondary" id="openImagesFolderButton" type="button"><svg><use href="#i-folder-open"></use></svg><span>打开图片目录</span></button>
               <button class="button secondary" id="refreshImagesButton" type="button"><svg><use href="#i-refresh"></use></svg><span>刷新</span></button>
             </div>
           </div>
+          <input class="hidden" type="file" id="imageFileInput" accept=".jpg,.jpeg,.png,.gif,.webp,.svg,.ico,.bmp,.avif" multiple>
           <div class="toolbar">
             <label class="search-box"><svg><use href="#i-search"></use></svg><input type="search" id="imageSearch" placeholder="搜索图片名称或路径"></label>
             <span class="toolbar-count" id="imageCountLabel">0 张图片</span>
           </div>
-          <div class="image-grid" id="imageGrid"></div>
-          <div class="empty-state settings-card hidden" id="imageEmptyState"><strong>没有找到图片</strong><span>请确认 source/img 目录中存在图片文件。</span></div>
+          <div class="drop-zone" id="imageDropZone">
+            <div class="image-grid" id="imageGrid"></div>
+            <div class="empty-state settings-card hidden" id="imageEmptyState"><strong>没有找到图片</strong><span>把图片拖到这里，或点击右上角“上传图片”。</span></div>
+            <div class="drop-overlay" id="imageDropOverlay">
+              <svg><use href="#i-upload"></use></svg>
+              <strong>松开鼠标即可上传</strong>
+              <span>支持 JPG、PNG、GIF、WEBP、SVG、ICO 等格式，可一次拖入多张</span>
+            </div>
+            <div class="drop-progress hidden" id="imageDropProgress"><svg class="spin"><use href="#i-sun"></use></svg><span>正在上传...</span></div>
+          </div>
         </section>
 
         <section class="page-section" id="section-operations" data-section-panel="operations">
@@ -374,7 +384,15 @@
     <header class="cover-header"><div><span class="eyebrow">COVER</span><h2>更换封面</h2><p id="coverPostPath">选择一篇文章</p></div><button class="icon-button" id="closeCoverButton" type="button" aria-label="关闭封面对话框"><svg><use href="#i-x"></use></svg></button></header>
     <div class="cover-current"><div class="cover-preview"><img id="coverPreviewImage" alt="当前封面"><span id="coverPreviewEmpty"><svg><use href="#i-image"></use></svg>未设置封面</span></div><div class="cover-current-copy"><span>当前 cover 字段</span><code id="coverCurrentValue">未设置</code><small id="coverExternalHint"></small></div></div>
     <div class="cover-library-heading"><strong>图片库</strong><span>点击图片选择封面，再次点击可取消选择</span></div>
-    <div class="cover-library" id="coverLibrary"></div>
+    <div class="cover-library drop-zone" id="coverLibraryDropZone">
+      <div class="cover-library-inner" id="coverLibrary"></div>
+      <div class="drop-overlay compact" id="coverDropOverlay">
+        <svg><use href="#i-upload"></use></svg>
+        <strong>松开鼠标即可上传</strong>
+        <span>支持 JPG、PNG、WEBP、GIF，可一次拖入多张</span>
+      </div>
+      <div class="drop-progress hidden" id="coverDropProgress"><svg class="spin"><use href="#i-sun"></use></svg><span>正在上传...</span></div>
+    </div>
     <footer class="cover-footer"><button class="button secondary hidden" id="removeCoverButton" type="button"><svg><use href="#i-trash"></use></svg><span>移除封面</span></button><div class="cover-footer-actions"><button class="button secondary" id="addCoverUrlButton" type="button"><svg><use href="#i-link"></use></svg><span>从 URL 添加图片</span></button><button class="button secondary" id="uploadCoverButton" type="button"><svg><use href="#i-upload"></use></svg><span>上传本地图片</span></button><button class="button secondary" id="cancelCoverButton" type="button">取消</button><button class="button primary" id="confirmCoverButton" type="button"><svg><use href="#i-check"></use></svg><span>确认</span></button></div></footer>
     <input class="hidden" type="file" id="coverFileInput" accept=".jpg,.jpeg,.png,.webp,.gif">
   </dialog>

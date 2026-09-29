@@ -1625,6 +1625,128 @@ async function uploadCoverImage(file) {
   }
 }
 
+const DROP_IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif"]);
+const DROP_COVER_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif"]);
+
+function fileExtension(name) {
+  const index = String(name || "").lastIndexOf(".");
+  return index < 0 ? "" : String(name).slice(index).toLowerCase();
+}
+
+// 上传前先在前端分流，避免把明显无效的文件发给后端
+function partitionDroppedFiles(files, allowedExtensions) {
+  const valid = [];
+  const rejected = [];
+  Array.from(files || []).forEach((file) => {
+    const extension = fileExtension(file.name);
+    if (!allowedExtensions.has(extension)) {
+      rejected.push({ name: file.name, reason: `不支持的格式 ${extension || "（无扩展名）"}` });
+    } else if (file.size === 0) {
+      rejected.push({ name: file.name, reason: "文件内容为空" });
+    } else {
+      valid.push(file);
+    }
+  });
+  return { valid, rejected };
+}
+
+async function uploadImageFiles(files, scope) {
+  const form = new FormData();
+  form.append("scope", scope);
+  Array.from(files).forEach((file) => form.append("files", file, file.name));
+  return api("/api/images/upload", { method: "POST", body: form });
+}
+
+function reportUploadOutcome(data, rejected, noun = "张图片") {
+  const succeeded = data?.succeeded ?? (data?.image ? 1 : 0);
+  const failed = [...(rejected || []), ...((data?.results || []).filter((item) => !item.ok))];
+  if (!failed.length) {
+    toast("上传完成", `已成功上传 ${succeeded} ${noun}。`, "success", 5000);
+    return;
+  }
+  if (!succeeded) {
+    toast("上传失败", failed.map((item) => `${item.name}：${item.reason || item.error}`).join("\n"), "error", 9000);
+    return;
+  }
+  toast(
+    "部分文件已上传",
+    `${succeeded} 张成功，${failed.length} 张失败：` + failed.map((item) => `${item.name}（${item.reason || item.error}）`).join("；"),
+    "warning",
+    9000,
+  );
+}
+
+function describeUploadError(error) {
+  if (error?.details?.payload_too_large) return error.message;
+  if (error?.details?.upload_failed) {
+    const lines = (error.details.results || []).filter((item) => !item.ok)
+      .map((item) => `${item.name}：${item.error}`);
+    return lines.length ? `全部上传失败\n${lines.join("\n")}` : error.message;
+  }
+  return error?.message || "未知错误";
+}
+
+// 统一的拖拽落区：用计数器抵消子元素产生的 dragleave，避免高亮闪烁
+function bindImageDropZone({ zone, overlay, progress, extensions, onFiles, noun }) {
+  if (!zone) return;
+  let depth = 0;
+
+  const showOverlay = (visible) => {
+    overlay?.classList.toggle("visible", visible);
+    zone.classList.toggle("drop-active", visible);
+    document.body.classList.toggle("drop-in-progress", visible);
+  };
+  const reset = () => {
+    depth = 0;
+    showOverlay(false);
+  };
+  const hasFiles = (event) =>
+    Array.from(event.dataTransfer?.types || []).includes("Files");
+
+  zone.addEventListener("dragenter", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    depth += 1;
+    showOverlay(true);
+  });
+  zone.addEventListener("dragover", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    showOverlay(true);
+  });
+  zone.addEventListener("dragleave", (event) => {
+    if (!hasFiles(event)) return;
+    depth = Math.max(0, depth - 1);
+    if (depth === 0) showOverlay(false);
+  });
+  // 拖拽被取消（按 Esc 或拖到别处松开）时不会触发 drop，需在此复位，否则高亮会卡住
+  zone.addEventListener("dragend", reset);
+  zone.addEventListener("drop", async (event) => {
+    if (!event.dataTransfer) return;
+    event.preventDefault();
+    reset();
+    const dropped = Array.from(event.dataTransfer.files || []);
+    if (!dropped.length) return;
+    const { valid, rejected } = partitionDroppedFiles(dropped, extensions);
+    rejected.forEach((item) => appendLog({ time: new Date().toLocaleTimeString("zh-CN", { hour12: false }), level: "warning", text: `已忽略非图片文件：${item.name}` }));
+    if (!valid.length) {
+      toast("没有可上传的图片", rejected.map((item) => `${item.name}（${item.reason}）`).join("\n"), "error", 9000);
+      return;
+    }
+    progress?.classList.remove("hidden");
+    try {
+      const data = await onFiles(valid, rejected);
+      reportUploadOutcome(data, rejected, noun);
+    } catch (error) {
+      const lines = [...rejected.map((item) => `${item.name}（${item.reason}）`), describeUploadError(error)];
+      toast("上传失败", lines.join("\n"), "error", 10000);
+    } finally {
+      progress?.classList.add("hidden");
+    }
+  });
+}
+
 async function addCoverFromUrl() {
   const url = window.prompt("请输入图片 URL：");
   if (!url) return;
@@ -2318,6 +2440,50 @@ async function loadImages(options = {}) {
   } catch (error) {
     if (!quiet) toast("无法加载图片", error.message, "error");
   }
+}
+
+async function uploadImagesFromPicker(fileList) {
+  const button = $("#uploadImagesButton");
+  const { valid, rejected } = partitionDroppedFiles(fileList, DROP_IMAGE_EXTENSIONS);
+  rejected.forEach((item) => appendLog({ time: new Date().toLocaleTimeString("zh-CN", { hour12: false }), level: "warning", text: `已忽略非图片文件：${item.name}` }));
+  if (!valid.length) {
+    toast("没有可上传的图片", rejected.map((item) => `${item.name}（${item.reason}）`).join("\n"), "error", 9000);
+    return;
+  }
+  setButtonBusy(button, true, "上传中...");
+  try {
+    const data = await uploadImageFiles(valid, "all");
+    reportUploadOutcome(data, rejected);
+    await loadImages({ quiet: true });
+  } catch (error) {
+    toast("上传失败", describeUploadError(error), "error", 9000);
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+async function handleImageDrop(files) {
+  const data = await uploadImageFiles(files, "all");
+  // 新图片排在最前：列表接口按 modified 倒序返回
+  await loadImages({ quiet: true });
+  return data;
+}
+
+async function handleCoverDrop(files) {
+  const data = await uploadImageFiles(files, "cover");
+  const images = data.images || [];
+  if (images.length) {
+    // 最后一张作为当前选中，其余也加入“新加入”分组
+    images.forEach((image, index) => {
+      if (index === images.length - 1) addNewCoverImage(image);
+      else {
+        state.images = [image, ...state.images.filter((item) => item.relative_path !== image.relative_path)];
+        state.cover.newImages.add(image.relative_path);
+      }
+    });
+    renderCoverLibrary();
+  }
+  return data;
 }
 
 function renderImages() {
@@ -3729,6 +3895,28 @@ function bindEvents() {
   $("#refreshImagesButton").addEventListener("click", () => loadImages());
   $("#openImagesFolderButton").addEventListener("click", () => openImageFolder(""));
   $("#imageSearch").addEventListener("input", renderImages);
+  $("#uploadImagesButton").addEventListener("click", () => $("#imageFileInput").click());
+  $("#imageFileInput").addEventListener("change", () => {
+    const files = $("#imageFileInput").files;
+    $("#imageFileInput").value = "";
+    if (files?.length) uploadImagesFromPicker(files);
+  });
+  bindImageDropZone({
+    zone: $("#imageDropZone"),
+    overlay: $("#imageDropOverlay"),
+    progress: $("#imageDropProgress"),
+    extensions: DROP_IMAGE_EXTENSIONS,
+    onFiles: handleImageDrop,
+    noun: "张图片",
+  });
+  bindImageDropZone({
+    zone: $("#coverLibraryDropZone"),
+    overlay: $("#coverDropOverlay"),
+    progress: $("#coverDropProgress"),
+    extensions: DROP_COVER_EXTENSIONS,
+    onFiles: handleCoverDrop,
+    noun: "张封面图片",
+  });
   $("#closeImageDialogButton").addEventListener("click", () => $("#imageDialog").close());
   $("#imageDialog").addEventListener("click", (event) => { if (event.target === $("#imageDialog")) { resetImageViewer(); $("#imageDialog").close(); } });
 
@@ -3902,9 +4090,33 @@ function bindEvents() {
   });
 }
 
+// 拖到落区以外的地方时，阻止浏览器直接打开该文件
+function bindGlobalDropGuard() {
+  ["dragover", "drop"].forEach((type) => {
+    document.addEventListener(type, (event) => {
+      if (Array.from(event.dataTransfer?.types || []).includes("Files")) event.preventDefault();
+    });
+  });
+  window.addEventListener("dragover", (event) => event.preventDefault());
+  window.addEventListener("drop", (event) => {
+    event.preventDefault();
+    clearAllDropHighlights();
+  });
+  // 拖拽以任何方式结束时（含按 Esc 取消、拖到窗口外松开）统一复位，避免高亮卡住
+  window.addEventListener("dragend", clearAllDropHighlights);
+  window.addEventListener("blur", clearAllDropHighlights);
+}
+
+function clearAllDropHighlights() {
+  document.body.classList.remove("drop-in-progress");
+  $$(".drop-zone.drop-active").forEach((zone) => zone.classList.remove("drop-active"));
+  $$(".drop-overlay.visible").forEach((overlay) => overlay.classList.remove("visible"));
+}
+
 async function init() {
   initPanelTheme();
   updateHighlightTheme();
+  bindGlobalDropGuard();
   const savedPort = localStorage.getItem("blog-manager-preview-port") || "4000";
   $("#previewPort").value = savedPort;
   $(".preview-card .command-line").innerHTML = previewCommandMarkup(savedPort);
