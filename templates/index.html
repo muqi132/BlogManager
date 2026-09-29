@@ -256,7 +256,7 @@
             </article>
             <article class="action-card preview-card">
               <div class="action-icon"><svg><use href="#i-play"></use></svg></div>
-              <div class="action-copy"><span class="action-kicker">DEVELOP</span><h2>本地预览</h2><p>依次执行 hexo clean、hexo generate，再启动 Hexo 本地服务；端口占用时会提示新的可用端口。</p><div class="port-row"><label for="previewPort">端口</label><input type="number" id="previewPort" min="1024" max="65535" value="4000"><span id="previewPortState">等待检查</span></div><div class="command-line stacked"><span>$</span> hexo clean<br><span>$</span> hexo generate<br><span>$</span> hexo server -p 4000</div></div>
+              <div class="action-copy"><span class="action-kicker">DEVELOP</span><h2>本地预览</h2><p>依次执行 hexo clean、hexo generate，再启动 Hexo 本地服务；端口占用时会提示新的可用端口。</p><div class="port-row"><label for="previewPort">端口</label><input type="number" id="previewPort" min="1024" max="65535" value="4000"><span id="previewPortState">等待检查</span><button class="text-button suggested-port-button hidden" id="useSuggestedPortButton" type="button">使用建议端口</button></div><div class="command-line stacked"><span>$</span> hexo clean<br><span>$</span> hexo generate<br><span>$</span> hexo server -p 4000</div></div>
               <div class="button-row preview-actions"><button class="button primary" type="button" id="previewButton"><svg><use href="#i-play"></use></svg><span>启动预览</span></button><button class="button secondary" type="button" id="forceGenerateButton"><svg><use href="#i-refresh"></use></svg><span>强制重新生成</span></button><button class="button secondary" type="button" id="stopPreviewButton" disabled><svg><use href="#i-stop"></use></svg><span>停止</span></button></div>
             </article>
             <article class="action-card utility-card">
@@ -336,7 +336,7 @@
         <div class="pane-header"><span>Markdown 源码</span><span>Ctrl+B / Ctrl+I / Ctrl+K / Ctrl+S</span></div>
         <div class="markdown-source-wrap">
           <pre class="markdown-line-numbers" id="markdownLineNumbers"></pre>
-          <div class="markdown-source-layer"><pre class="markdown-highlight" id="markdownHighlight" aria-hidden="true"></pre><textarea id="markdownSource" spellcheck="false"></textarea></div>
+          <div class="markdown-source-layer"><pre class="markdown-highlight" id="markdownHighlight" aria-hidden="true"></pre><textarea id="markdownSource" spellcheck="false" wrap="off"></textarea></div>
         </div>
       </section>
       <div class="markdown-resizer" id="markdownResizer" title="拖动调整宽度"></div>
@@ -411,7 +411,7 @@
       <label class="check-row"><input type="checkbox" id="autoDeployOverwrite"><span>已有 Hexo 项目时覆盖站点配置和主题覆盖配置</span></label>
       <label class="check-row"><input type="checkbox" id="autoDeployCopyContent"><span>同时复制当前博客的文章和图片</span></label>
       <label class="check-row"><input type="checkbox" id="autoDeployLocalOnly"><span>仅本地创建（不配置远程仓库，完成后只提供本地预览）</span></label>
-      <div class="notice info autodeploy-notice" id="autoDeployNotice"><svg><use href="#i-info"></use></svg><div><strong>执行内容</strong><span>初始化 Hexo → 克隆 Butterfly → 应用配置 → 配置 LaTeX 渲染 → npm install → 安装并检查渲染器 → hexo generate。全过程将在独立进度页实时显示。</span></div></div>
+      <div class="notice info autodeploy-notice" id="autoDeployNotice"><svg><use href="#i-info"></use></svg><div><strong>执行内容</strong><span>初始化 Hexo → 克隆 Butterfly → 应用配置 → 配置 LaTeX 渲染 → npm install → 检查渲染器 → 复制现有内容（勾选时） → hexo generate。全过程将在独立进度页实时显示。</span></div></div>
       <div class="dialog-actions"><button class="button secondary" id="closeAutoDeployDialog" type="button">取消</button><button class="button primary" id="startAutoDeployButton" type="button">开始自动部署</button></div>
     </form>
   </dialog>

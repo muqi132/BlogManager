@@ -277,7 +277,8 @@ function configMetadataFor(kind, path) {
   const metadataRoot = CONFIG_METADATA[kind] || {};
   const groupMetadata = metadataRoot[parts[0]] || null;
   const relativePath = parts.length > 1 ? parts.slice(1).join(".") : ".";
-  const fieldMetadata = groupMetadata?.fields?.[relativePath]
+  const fieldMetadata = metadataRoot.staticFields?.[path]
+    || groupMetadata?.fields?.[relativePath]
     || groupMetadata?.fields?.[path]
     || groupMetadata?.fields?.["*"]
     || null;
@@ -613,7 +614,7 @@ function renderConfigGroups(container, groups, values, kind) {
       cell.className = `setting-field ${field.span === 2 ? "span-2" : ""} ${field.type === "boolean" ? "boolean-field" : ""}`.trim();
       cell.dataset.configField = field.path;
       const metadata = configMetadataFor(kind, field.path);
-      const displayHint = field.hint || metadata.field?.description || group.description || resolveConfigDescription(kind, field.path);
+      const displayHint = field.hint || metadata.field?.description || resolveConfigDescription(kind, field.path);
       const textWrap = document.createElement("div");
       const label = document.createElement("label");
       label.className = "setting-label";
@@ -1989,7 +1990,10 @@ function highlightMarkdown(source) {
 function updateMarkdownLineNumbers() {
   const source = $("#markdownSource").value;
   const count = Math.max(1, source.split("\n").length);
-  $("#markdownLineNumbers").textContent = Array.from({ length: count }, (_item, index) => index + 1).join("\n");
+  const numbers = $("#markdownLineNumbers");
+  if (numbers.dataset.lineCount === String(count)) return;
+  numbers.textContent = Array.from({ length: count }, (_item, index) => index + 1).join("\n");
+  numbers.dataset.lineCount = String(count);
 }
 
 function syncMarkdownScroll() {
@@ -2193,17 +2197,24 @@ function renderMarkdownPreview() {
 function scheduleMarkdownPreview() {
   clearTimeout(state.editor.renderTimer);
   if (state.editor.composing) return;
-  state.editor.renderTimer = setTimeout(renderMarkdownPreview, 300);
+  state.editor.renderTimer = setTimeout(renderMarkdownPreview, 360);
 }
 
 function refreshMarkdownEditorView() {
+  if (state.editor.composing) return;
   const source = $("#markdownSource");
+  const hasFocus = document.activeElement === source;
+  const selectionStart = hasFocus ? source.selectionStart : null;
+  const selectionEnd = hasFocus ? source.selectionEnd : null;
   state.editor.content = source.value;
   state.editor.dirty = state.editor.content !== state.editor.original;
   $("#markdownStatus").textContent = state.editor.dirty ? "未保存" : "已加载";
   $("#markdownStatus").className = `markdown-status ${state.editor.dirty ? "dirty" : ""}`;
   $("#markdownHighlight").innerHTML = highlightMarkdown(state.editor.content);
   updateMarkdownLineNumbers();
+  if (hasFocus && document.activeElement === source && (source.selectionStart !== selectionStart || source.selectionEnd !== selectionEnd)) {
+    source.setSelectionRange(selectionStart, selectionEnd);
+  }
   syncMarkdownScroll();
   scheduleMarkdownPreview();
 }
@@ -2713,7 +2724,8 @@ async function startCommand(kind) {
     } else if (kind === "preview" && error.details?.suggested_port) {
       $("#previewPortState").textContent = `端口 ${error.details.port} 已占用，建议 ${error.details.suggested_port}`;
       $("#previewPortState").className = "occupied";
-      toast("预览端口被占用", `请改用 ${error.details.suggested_port} 或其他端口。`, "warning", 6500);
+      updateSuggestedPortButton(error.details.suggested_port);
+      toast("预览端口被占用", `可点击“使用建议端口”自动改用 ${error.details.suggested_port}。`, "warning", 6500);
     } else {
       toast(kind === "deploy" ? "无法开始部署" : "无法启动预览", error.message, "error");
     }
@@ -2838,6 +2850,32 @@ async function repairPreviewDependencies() {
   }
 }
 
+function updateSuggestedPortButton(port) {
+  const button = $("#useSuggestedPortButton");
+  if (!button) return;
+  const value = Number(port);
+  if (Number.isInteger(value) && value >= 1024 && value <= 65535) {
+    button.dataset.port = String(value);
+    button.classList.remove("hidden");
+  } else {
+    button.dataset.port = "";
+    button.classList.add("hidden");
+  }
+}
+
+async function useSuggestedPreviewPort() {
+  const button = $("#useSuggestedPortButton");
+  const port = Number(button?.dataset.port || 0);
+  if (!(port >= 1024 && port <= 65535)) return;
+  const input = $("#previewPort");
+  input.value = String(port);
+  localStorage.setItem("blog-manager-preview-port", String(port));
+  $(".preview-card .command-line").innerHTML = previewCommandMarkup(port);
+  button.classList.add("hidden");
+  toast("已切换到建议端口", `将使用端口 ${port} 重新启动预览。`, "info", 3500);
+  await requestPreview();
+}
+
 async function checkPreviewPort(showToast = false) {
   const port = Number($("#previewPort").value || 4000);
   const stateLabel = $("#previewPortState");
@@ -2850,6 +2888,7 @@ async function checkPreviewPort(showToast = false) {
     const result = await api(`/api/preview/check?port=${encodeURIComponent(port)}`, { cache: "no-store" });
     stateLabel.textContent = result.occupied ? `已占用，建议 ${result.suggested_port}` : "端口可用";
     stateLabel.className = result.occupied ? "occupied" : "available";
+    updateSuggestedPortButton(result.occupied ? result.suggested_port : "");
     localStorage.setItem("blog-manager-preview-port", String(port));
     $(".preview-card .command-line").innerHTML = previewCommandMarkup(port);
     if (showToast && result.occupied) toast("端口已被占用", `可改用 ${result.suggested_port} 或其他端口。`, "warning");
@@ -3595,6 +3634,7 @@ function bindEvents() {
   $("#forceGenerateButton").addEventListener("click", forceGenerate);
   $("#stopPreviewButton").addEventListener("click", () => stopPreview());
   $("#previewPort").addEventListener("change", () => checkPreviewPort(true));
+  $("#useSuggestedPortButton").addEventListener("click", useSuggestedPreviewPort);
   $("#previewPort").addEventListener("input", () => {
     clearTimeout(checkPreviewPort.timer);
     checkPreviewPort.timer = setTimeout(() => checkPreviewPort(false), 450);
@@ -3709,7 +3749,8 @@ function bindEvents() {
     state.editor.dirty = state.editor.content !== state.editor.original;
     $("#markdownStatus").textContent = state.editor.dirty ? "未保存" : "已加载";
     $("#markdownStatus").className = `markdown-status ${state.editor.dirty ? "dirty" : ""}`;
-    if (!state.editor.composing) refreshMarkdownEditorView();
+    if (state.editor.composing) return;
+    refreshMarkdownEditorView();
   });
   $("#markdownSource").addEventListener("compositionstart", () => {
     state.editor.composing = true;
@@ -3717,7 +3758,11 @@ function bindEvents() {
   });
   $("#markdownSource").addEventListener("compositionend", () => {
     state.editor.composing = false;
-    requestAnimationFrame(refreshMarkdownEditorView);
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (!state.editor.composing) refreshMarkdownEditorView();
+      });
+    });
   });
   $("#markdownSource").addEventListener("scroll", syncMarkdownScroll);
   $("#markdownSource").addEventListener("keydown", (event) => {

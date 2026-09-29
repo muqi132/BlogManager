@@ -52,13 +52,13 @@
 
 ## 分发给别人
 
-项目源码可以安全复制或打包。若要生成排除本机依赖和用户配置的 ZIP，在项目根目录执行：
+项目源码可以安全复制或打包。若要生成排除本机依赖和用户配置的 ZIP，在项目根目录双击 `package.bat`：
 
-```powershell
-python build_release.py
+```bat
+package.bat
 ```
 
-生成内容位于 `dist/BlogManager/`，压缩包名为 `dist/BlogManager_v1.0.0_日期.zip`。也可以传入版本号，例如 `python build_release.py 1.1.0`。脚本不会打包 `.venv`、`.git`、`node_modules`、`config.json`、`settings.json`、日志、缓存、临时文件或 `dist` 自身。
+生成文件位于 `dist/BlogManager_YYYYMMDD.zip`。脚本会排除 `.venv`、`.git`、`node_modules`、`.userdata`、`.deps`、`.testblog`、`config.json`、`settings.json`、`*.blogmanager.bak`、`*.blogmanager.tmp`、日志、缓存、临时文件或 `dist` 自身，并在压缩完成后再次扫描 ZIP；发现敏感文件时会删除压缩包并终止打包。
 
 也可以直接复制项目中的源码文件，但不要复制 `.venv/`、`.userdata/`、`config.json`、`settings.json` 或任何本机日志。
 

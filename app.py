@@ -1372,25 +1372,27 @@ def suggest_preview_port(start: int = 4000) -> int:
     return start
 
 
-def command_for(kind: str, port: int | None = None) -> tuple[str, list[str]]:
+def hexo_command(target: Path, args: list[str]) -> list[str]:
+    local_name = "hexo.cmd" if os.name == "nt" else "hexo"
+    local_hexo = target / "node_modules" / ".bin" / local_name
+    if local_hexo.is_file():
+        if os.name == "nt":
+            return ["cmd.exe", "/d", "/s", "/c", "call", str(local_hexo), *args]
+        return [str(local_hexo), *args]
+    return command_executable("npx", ["--yes", "hexo", *args])
+
+
+def command_for(kind: str, port: int | None = None, target: Path | None = None) -> tuple[str, list[str]]:
+    cwd = Path(target or Path.cwd())
     if kind == "deploy":
         command_text = "hexo clean && hexo deploy"
-    elif kind == "preview":
+        command_args = ["cmd.exe", "/d", "/s", "/c", command_text] if os.name == "nt" else ["/bin/sh", "-lc", command_text]
+        return command_text, command_args
+    if kind == "preview":
         port = validate_port(port or 4000)
         command_text = f"hexo server -p {port}"
-    else:
-        raise ApiError(f"未知任务类型：{kind}")
-
-    if os.name == "nt":
-        return command_text, ["cmd.exe", "/d", "/s", "/c", command_text]
-    return command_text, ["/bin/sh", "-lc", command_text]
-
-
-def hexo_command(args: list[str]) -> list[str]:
-    command_text = "hexo " + " ".join(args)
-    if os.name == "nt":
-        return ["cmd.exe", "/d", "/s", "/c", command_text]
-    return ["/bin/sh", "-lc", command_text]
+        return command_text, hexo_command(cwd, ["server", "-p", str(port)])
+    raise ApiError(f"未知任务类型：{kind}")
 
 
 def run_process(task: Task) -> None:
@@ -1488,7 +1490,7 @@ def has_frontmatter_generation_error(output: str) -> bool:
 
 def run_generate_with_auto_repair(task: Task, target: Path) -> tuple[int, dict[str, Any]]:
     start = len(task.lines)
-    code = run_task_command(task, hexo_command(["generate"]), target, "hexo generate")
+    code = run_task_command(task, hexo_command(target, ["generate"]), target, "hexo generate")
     output = task_output_since(task, start)
     if not has_frontmatter_generation_error(output):
         return code, {"changed": 0, "errors": [], "results": []}
@@ -1509,10 +1511,10 @@ def run_generate_with_auto_repair(task: Task, target: Path) -> tuple[int, dict[s
 
     if repair["changed"]:
         task.emit("清理缓存后重新生成...", "system")
-        clean_code = run_task_command(task, hexo_command(["clean"]), target, "hexo clean")
+        clean_code = run_task_command(task, hexo_command(target, ["clean"]), target, "hexo clean")
         if clean_code != 0:
             return clean_code, repair
-        code = run_task_command(task, hexo_command(["generate"]), target, "hexo generate")
+        code = run_task_command(task, hexo_command(target, ["generate"]), target, "hexo generate")
     return code, repair
 
 
@@ -1521,7 +1523,7 @@ def run_preview_process(task: Task) -> None:
     try:
         task.emit("========== 开始本地预览 ==========", "system")
         task.emit("[1/3] 清理缓存...", "system")
-        code = run_task_command(task, hexo_command(["clean"]), target, "hexo clean")
+        code = run_task_command(task, hexo_command(target, ["clean"]), target, "hexo clean")
         if task.stop_requested:
             task.emit("本地预览已停止。", "warning")
             task.finish("stopped", None)
@@ -1551,7 +1553,7 @@ def run_preview_process(task: Task) -> None:
 
         task.emit("[3/3] 启动本地服务器...", "system")
         task.port = task.port or 4000
-        task.command_args = command_for("preview", task.port)[1]
+        task.command_args = command_for("preview", task.port, target)[1]
         run_process(task)
     except (AutodeployError, ApiError) as exc:
         message = str(exc)
@@ -1572,7 +1574,7 @@ def run_generate_process(task: Task) -> None:
     try:
         task.emit("========== 开始强制重新生成 ==========", "system")
         task.emit("[1/2] 清理缓存...", "system")
-        code = run_task_command(task, hexo_command(["clean"]), target, "hexo clean")
+        code = run_task_command(task, hexo_command(target, ["clean"]), target, "hexo clean")
         if task.stop_requested:
             task.emit("重新生成已停止。", "warning")
             task.finish("stopped", None)
@@ -1615,15 +1617,53 @@ def run_generate_process(task: Task) -> None:
             task.finish("failed", -1)
 
 
+def run_deploy_process(task: Task) -> None:
+    target = Path(task.cwd)
+    try:
+        task.emit("========== 开始一键部署 ==========", "system")
+        code = run_task_command(task, hexo_command(target, ["clean"]), target, "hexo clean")
+        if task.stop_requested:
+            task.emit("部署已停止。", "warning")
+            task.finish("stopped", None)
+            return
+        if code != 0:
+            raise AutodeployError("hexo clean 失败，请查看上方日志。")
+        code = run_task_command(task, hexo_command(target, ["deploy"]), target, "hexo deploy")
+        if task.stop_requested:
+            task.emit("部署已停止。", "warning")
+            task.finish("stopped", None)
+            return
+        if code != 0:
+            raise AutodeployError("hexo deploy 失败，请检查部署配置、网络和仓库权限。")
+        task.emit("一键部署完成。", "success")
+        task.finish("success", 0)
+    except (AutodeployError, ApiError) as exc:
+        message = str(exc)
+        task.error_message = message
+        if task.status == "running":
+            task.emit(message, "error")
+            task.finish("failed", -1)
+    except Exception as exc:
+        message = str(exc)
+        task.error_message = message
+        if task.status == "running":
+            task.emit(f"部署异常：{message}", "error")
+            task.finish("failed", -1)
+
+
 def start_process_task(kind: str, cwd: Path, port: int | None = None) -> Task:
     if kind == "preview":
         port = validate_port(port or 4000)
         command_text = f"hexo clean\nhexo generate\nhexo server -p {port}"
         task = task_manager.create(kind, command_text, cwd, port)
-        task.command_args = command_for("preview", port)[1]
+        task.command_args = command_for("preview", port, cwd)[1]
         threading.Thread(target=run_preview_process, args=(task,), daemon=True).start()
         return task
-    command_text, command_args = command_for(kind, port)
+    if kind == "deploy":
+        task = task_manager.create(kind, "hexo clean && hexo deploy", cwd)
+        threading.Thread(target=run_deploy_process, args=(task,), daemon=True).start()
+        return task
+    command_text, command_args = command_for(kind, port, cwd)
     task = task_manager.create(kind, command_text, cwd, port)
     task.command_args = command_args
     threading.Thread(target=run_process, args=(task,), daemon=True).start()
@@ -1715,7 +1755,12 @@ def open_preview_when_ready(task: Task) -> None:
         return
     task.emit(f"预览服务已就绪，正在打开：{preview_url}", "success")
     try:
-        webbrowser.open_new_tab(preview_url)
+        before = browser_process_snapshot()
+        opened = webbrowser.open_new_tab(preview_url)
+        if opened:
+            new_pids = track_fallback_browser_processes(before)
+            if new_pids:
+                task.emit(f"预览浏览器进程已记录：{', '.join(str(pid) for pid in new_pids)}", "muted")
     except Exception as exc:
         task.emit(f"无法自动打开浏览器：{exc}", "warning")
 
@@ -3239,6 +3284,50 @@ def validate_autodeploy_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def copy_current_content(target: Path, task: Task) -> dict[str, int]:
+    source_root = require_blog_directory().resolve()
+    target_root = target.resolve()
+    if source_root == target_root:
+        raise AutodeployError("目标目录就是当前博客目录，不能复制到自身。")
+    if source_root in target_root.parents:
+        raise AutodeployError("目标目录位于当前博客目录内部，拒绝复制以避免递归。")
+    sources = (
+        (source_root / "source" / "_posts", target_root / "source" / "_posts", "文章"),
+        (source_root / "source" / "img", target_root / "source" / "img", "图片"),
+    )
+    if not any(source.exists() for source, _, _ in sources):
+        raise AutodeployError("当前博客没有 source/_posts 或 source/img，无法复制现有内容。")
+    counts = {"posts": 0, "images": 0, "skipped": 0}
+    for source, destination, label in sources:
+        if not source.exists():
+            task.emit(f"源目录不存在，跳过{label}复制：{source}", "warning")
+            continue
+        for item in source.rglob("*"):
+            if not item.is_file():
+                continue
+            relative = item.relative_to(source)
+            target_item = destination / relative
+            if target_item.exists():
+                counts["skipped"] += 1
+                task.emit(f"同名文件已存在，跳过：{target_item.relative_to(target_root).as_posix()}", "muted")
+                continue
+            try:
+                target_item.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, target_item)
+            except OSError as exc:
+                raise AutodeployError(f"复制{label}失败：{item} -> {target_item}：{exc}") from exc
+            if label == "文章":
+                counts["posts"] += 1
+            else:
+                counts["images"] += 1
+    task.emit(
+        f"已复制 {counts['posts']} 篇文章、{counts['images']} 张图片"
+        + (f"，跳过同名文件 {counts['skipped']} 个" if counts["skipped"] else ""),
+        "success",
+    )
+    return counts
+
+
 def apply_autodeploy_config(target: Path, options: dict[str, Any], task: Task) -> None:
     if not options["overwrite_config"]:
         task.emit("保留目标项目现有配置（更新模式未勾选覆盖配置）。", "warning")
@@ -3506,6 +3595,12 @@ def autodeploy_step_definitions(options: dict[str, Any]) -> list[dict[str, str]]
             {"id": "latex", "title": "配置 LaTeX 渲染"},
             {"id": "deps", "title": "安装依赖"},
             {"id": "deps-check", "title": "检查主题渲染依赖"},
+        ]
+    )
+    if options.get("copy_content"):
+        steps.append({"id": "copy", "title": "复制当前博客文章和图片"})
+    steps.extend(
+        [
             {"id": "welcome", "title": "添加欢迎文章"},
             {"id": "generate", "title": "生成静态文件"},
         ]
@@ -3800,6 +3895,12 @@ def run_autodeploy(task: Task, options: dict[str, Any]) -> None:
                     "请点击“修复依赖”重新安装。"
                 )
             task.emit_step(current_step, "success", "渲染器依赖和主题配置检查通过")
+
+        if options.get("copy_content") and step_enabled("copy"):
+            current_step = "copy"
+            task.emit_step(current_step, "running")
+            copy_current_content(target, task)
+            task.emit_step(current_step, "success", "已复制现有内容")
 
         if step_enabled("welcome"):
             current_step = "welcome"
@@ -4323,6 +4424,61 @@ def open_app_window_when_ready(url: str, timeout: float = 20.0) -> None:
     open_app_window(url)
 
 
+BROWSER_PROCESS_NAMES = {
+    "msedge.exe",
+    "chrome.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+    "vivaldi.exe",
+    "iexplore.exe",
+}
+
+
+def browser_process_snapshot() -> set[int]:
+    if os.name != "nt":
+        return set()
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=NO_WINDOW,
+            check=False,
+        )
+    except OSError:
+        return set()
+    pids: set[int] = set()
+    for row in csv.reader(io.StringIO(result.stdout)):
+        if len(row) < 2 or row[0].casefold() not in BROWSER_PROCESS_NAMES:
+            continue
+        try:
+            pids.add(int(row[1]))
+        except ValueError:
+            continue
+    return pids
+
+
+def track_fallback_browser_processes(before: set[int]) -> list[int]:
+    time.sleep(0.8)
+    after = browser_process_snapshot()
+    new_pids = sorted(after - before)
+    if new_pids:
+        with BROWSER_LOCK:
+            for pid in new_pids:
+                if pid not in BROWSER_PIDS:
+                    BROWSER_PIDS.append(pid)
+        LOGGER.warning("fallback browser process tracked | pids=%s", new_pids)
+    else:
+        LOGGER.warning(
+            "fallback browser process could not be tracked by PID; "
+            "please close the browser window manually when finished"
+        )
+    return new_pids
+
+
 def open_app_window(url: str) -> None:
     browser = find_browser()
     if browser:
@@ -4338,7 +4494,15 @@ def open_app_window(url: str) -> None:
             return
         except OSError:
             pass
-    webbrowser.open_new_tab(url)
+    LOGGER.warning("未找到 Edge/Chrome，回退到默认浏览器 | url=%s", url)
+    before = browser_process_snapshot()
+    opened = webbrowser.open_new_tab(url)
+    if not opened:
+        LOGGER.warning("默认浏览器未能确认打开 | url=%s", url)
+        return
+    new_pids = track_fallback_browser_processes(before)
+    if not new_pids:
+        LOGGER.warning("默认浏览器未产生可识别的新进程；退出时可能需要手动关闭浏览器窗口。")
 
 
 def parse_args() -> argparse.Namespace:
