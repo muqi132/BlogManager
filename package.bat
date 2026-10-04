@@ -49,7 +49,7 @@ if not exist "%TEMP_PACKAGE%" (
 )
 
 echo [2/4] 复制项目文件...
-robocopy "%ROOT%" "%TEMP_PACKAGE%" /E /XD ".venv" "__pycache__" ".git" "dist" "node_modules" ".e2e-yaml-probe" ".userdata" ".deps" ".testblog" /XF "*.pyc" "*.log" "config.json" "settings.json" "*.blogmanager.bak" "*.blogmanager.tmp" >nul
+robocopy "%ROOT%" "%TEMP_PACKAGE%" /E /XD ".venv" "__pycache__" ".git" "dist" "node_modules" ".e2e-yaml-probe" ".userdata" ".deps" ".testblog" ".blogmanager-trash" /XF "*.pyc" "*.log" "config.json" "settings.json" "*.blogmanager.bak" "*.blogmanager.tmp" "*.bak" "*.tmp" "push.bat" "package-lock.json" >nul
 set "ROBOCOPY_CODE=%ERRORLEVEL%"
 
 if %ROBOCOPY_CODE% GEQ 8 (
@@ -94,7 +94,7 @@ if not exist "%ZIP_FILE%" (
   exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; $z=[IO.Compression.ZipFile]::OpenRead('%ZIP_FILE%'); $bad=@($z.Entries | Where-Object { $_.FullName -match '(?i)(^|/)(\.userdata/|\.deps/|config\.json$|settings\.json$)|(\.blogmanager\.(bak|tmp)$)' } | ForEach-Object { $_.FullName }); $z.Dispose(); if($bad.Count -gt 0){ Write-Host ('[错误] 压缩包包含敏感文件：' + ($bad -join ', ')); exit 1 }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; $z=[IO.Compression.ZipFile]::OpenRead('%ZIP_FILE%'); $sep=[string][char]92; $bad=@($z.Entries | ForEach-Object { $_.FullName.Replace($sep,'/') } | Where-Object { $_ -match '(?i)(^|/)(\.venv|\.git|\.userdata|\.deps|\.testblog|\.blogmanager-trash|__pycache__|dist|logs|node_modules|\.e2e[^/]*)(/|$)|(^|/)(config\.json|settings\.json|push\.bat|package-lock\.json)$|\.(pyc|log|bak|tmp)$' } | Sort-Object -Unique); $z.Dispose(); if($bad.Count -gt 0){ Write-Host ('[错误] 压缩包包含敏感文件：' + ($bad -join ', ')); exit 1 }"
 if errorlevel 1 (
   echo [错误] 打包后检测到敏感文件，已删除压缩包。
   if exist "%ZIP_FILE%" del /f /q "%ZIP_FILE%" >nul 2>&1
@@ -120,7 +120,7 @@ echo.
 echo 生成的压缩包：
 echo %ZIP_FILE%
 echo.
-echo 已排除：.venv、__pycache__、.git、dist、node_modules、.e2e-yaml-probe、.userdata、.deps、.testblog、config.json、settings.json、*.blogmanager.bak、*.blogmanager.tmp、*.pyc、*.log
+echo 已排除：.venv、__pycache__、.git、dist、node_modules、.e2e-yaml-probe、.userdata、.deps、.testblog、.blogmanager-trash、push.bat、package-lock.json、config.json、settings.json、*.blogmanager.bak、*.blogmanager.tmp、*.bak、*.tmp、*.pyc、*.log
 echo.
 pause
 exit /b 0

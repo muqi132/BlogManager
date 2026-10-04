@@ -2,7 +2,9 @@
 
 100%AI（）
 
-一个面向 Hexo + Butterfly 的本地博客控制面板。项目本身不包含任何个人路径、GitHub 账号或 Token；首次运行时由每位用户填写自己的配置。
+一个面向 Hexo + Butterfly 的本地博客控制面板。首次运行时由每位用户填写自己的配置。
+
+**关于隐私的准确说明**：受版本控制（git tracked）的源码文件中不包含个人路径、GitHub 账号或 Token。但项目文件夹里还会有一些**不随源码分发**的本机目录（见下文「分发前检查清单」），例如 `.venv/` 会记录当前机器的 Python 安装路径与用户名。分发时请按清单清理，不要直接压缩整个文件夹。
 
 ## 启动前准备
 
@@ -52,15 +54,42 @@
 
 ## 分发给别人
 
-项目源码可以安全复制或打包。若要生成排除本机依赖和用户配置的 ZIP，在项目根目录双击 `package.bat`：
+**受版本控制的源码可以安全分发**：`app.py`、`static/`、`templates/`、`start.bat`、`package.bat`、`requirements.txt`、`README.md` 等文件不含个人路径、账号或 Token。
+
+但**不要直接压缩整个项目文件夹**。以下内容不受版本控制、不会随源码分发，却可能包含本机信息：
+
+- `.venv/` —— 虚拟环境，其中的 `pyvenv.cfg` 记录了当前机器的 Python 安装路径与 Windows 用户名
+- `.userdata/`、`.deps/`、`.testblog/` —— 运行期缓存与测试用目录
+- `config.json`、`settings.json` —— 用户配置，**含明文 GitHub Token**
+- `.blogmanager-trash/` —— 回收站，含你删除过的文章正文
+- `*.blogmanager.bak`、`*.blogmanager.tmp` —— 编辑文章/配置时留下的备份与临时文件
+- `logs/` 与 `*.log` —— 运行日志，含绝对路径与命令输出
+- `dist/` —— 打包产物
+- `__pycache__/`、`*.pyc` —— Python 编译缓存
+
+### 推荐方式：使用打包脚本
+
+若要生成排除上述内容的 ZIP，在项目根目录双击 `package.bat`：
 
 ```bat
 package.bat
 ```
 
-生成文件位于 `dist/BlogManager_YYYYMMDD.zip`。脚本会排除 `.venv`、`.git`、`node_modules`、`.userdata`、`.deps`、`.testblog`、`config.json`、`settings.json`、`*.blogmanager.bak`、`*.blogmanager.tmp`、日志、缓存、临时文件或 `dist` 自身，并在压缩完成后再次扫描 ZIP；发现敏感文件时会删除压缩包并终止打包。
+生成文件位于 `dist/BlogManager_YYYYMMDD.zip`。脚本会排除 `.venv`、`.git`、`node_modules`、`dist`、`__pycache__`、`.e2e-yaml-probe`、`.userdata`、`.deps`、`.testblog`、`.blogmanager-trash`、`config.json`、`settings.json`、`*.blogmanager.bak`、`*.blogmanager.tmp`、`*.pyc`、`*.log`，并在压缩完成后再次扫描 ZIP；发现敏感文件时会删除压缩包并终止打包。
 
-也可以直接复制项目中的源码文件，但不要复制 `.venv/`、`.userdata/`、`config.json`、`settings.json` 或任何本机日志。
+### 分发前检查清单
+
+手工复制源码时，请逐项确认：
+
+1. 删除 `.venv/`（接收方首次运行 `start.bat` 时会自己创建）
+2. 删除 `.userdata/`、`.deps/`、`.testblog/`（如果存在）
+3. 删除 `.blogmanager-trash/`（如果存在）
+4. 确认没有残留的 `*.blogmanager.bak`、`*.blogmanager.tmp`
+5. 确认没有残留的探针脚本或一次性测试目录（如 `.e2e-*`、`_probe*.py`、`_audit*.py`）
+6. 确认没有 `config.json`、`settings.json`、`logs/`
+7. 确认没有 `dist/` 里的旧压缩包
+
+**注意**：如果仓库曾经提交过 `.venv/pyvenv.cfg` 之类的文件，仅删除工作区文件并不够，历史提交里仍然保留；公开托管前请先检查历史（见下）。
 
 ## 常见问题
 
