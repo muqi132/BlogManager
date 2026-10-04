@@ -25,6 +25,18 @@ const markdownRenderer = window.markdownit ? window.markdownit({
     }
   },
 }) : null;
+
+// KaTeX 默认信任 \href / \url 的任意协议。文章内容可能来自克隆的第三方仓库，
+// 而预览运行在本机应用源下（可调用本地 API 写删文件），因此只放行 http(s)。
+const SAFE_MATH_PROTOCOLS = new Set(["http:", "https:"]);
+function katexTrustPolicy(context) {
+  if (!context || context.command !== "\\href") return false;
+  try {
+    return SAFE_MATH_PROTOCOLS.has(new URL(String(context.url || ""), "http://localhost").protocol);
+  } catch (_error) {
+    return false;
+  }
+}
 const state = {
   status: null,
   activeTaskId: null,
@@ -44,7 +56,7 @@ const state = {
   previewDependencies: null,
   images: [],
   imageViewer: { relativePath: "", name: "", url: "", size: 0, width: 0, height: 0, scale: 1, rotation: 0, x: 0, y: 0, dragging: false, startX: 0, startY: 0, originX: 0, originY: 0 },
-  editor: { relativePath: "", content: "", original: "", dirty: false, renderTimer: null, composing: false },
+  editor: { relativePath: "", content: "", original: "", dirty: false, renderTimer: null, composing: false, codeTokens: [] },
   configImage: { kind: "", path: "", selected: "", external: "", images: [], newImages: new Set(), loadToken: 0 },
   site: {
     loaded: false,
@@ -2176,24 +2188,52 @@ function closeMarkdownEditor() {
   $("#markdownDialog").close();
 }
 
-const MATH_PATTERN = /\$\$([\s\S]*?)\$\$|\\\[([\s\S]*?)\\\]|\\\(([\s\S]*?)\\\)|(^|[^$])\$([^$\n]+?)\$(?!\$)/g;
+// 行内公式要求 $ 内侧紧贴非空白字符，且开头不能是数字，避免把
+// "$5 and $10"、"$50$" 这类金额当成公式；\\[\s\S] 让公式内的 \$ 不被当作结束符。
+const INLINE_MATH = String.raw`(^|[^$\\])\$(?![\s$0-9])((?:\\[\s\S]|[^$\n\\])*[^\s$\\])\$(?!\$)`;
+const MATH_PATTERN = new RegExp(
+  String.raw`\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\\(([\s\S]+?)\\\)|` + INLINE_MATH,
+  "g",
+);
+// 围栏代码块与行内代码：其中的 $ 不应被当作公式（与 Hexo 渲染行为保持一致）
+const CODE_REGION_PATTERN = /```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`/g;
 
 function stripFrontMatter(source) {
   return source.replace(/^---\s*\r?\n[\s\S]*?\r?\n---\s*(?:\r?\n|$)/, "");
 }
 
+// 先把代码区域抽成占位符，后续的公式识别就不会误伤代码里的 $
+function protectCodeRegions(source) {
+  const codeTokens = [];
+  const text = source.replace(CODE_REGION_PATTERN, (match) => {
+    const index = codeTokens.push(match) - 1;
+    return `BM_CODE_${index}_TOKEN`;
+  });
+  return { text, codeTokens };
+}
+
+function restoreCodeTokens(html, codeTokens) {
+  return html.replace(/BM_CODE_(\d+)_TOKEN/g, (match, rawIndex) => {
+    const value = codeTokens[Number(rawIndex)];
+    return value === undefined ? match : value;
+  });
+}
+
 function protectMath(source) {
   const maths = [];
-  const text = source.replace(MATH_PATTERN, (match, displayDollar, displayBracket, inlineParen, prefix, inlineDollar) => {
-    let tex = "";
-    let display = false;
-    if (displayDollar !== undefined) { tex = displayDollar; display = true; }
-    else if (displayBracket !== undefined) { tex = displayBracket; display = true; }
-    else if (inlineParen !== undefined) { tex = inlineParen; display = false; }
-    else { tex = inlineDollar; display = false; }
-    const index = maths.push({ tex: tex.trim(), display }) - 1;
-    return `${prefix || ""}BM_MATH_${index}_TOKEN`;
-  });
+  const text = source.replace(
+    MATH_PATTERN,
+    (match, displayDollar, displayBracket, inlineParen, prefix, inlineDollar) => {
+      let tex = "";
+      let display = false;
+      if (displayDollar !== undefined) { tex = displayDollar; display = true; }
+      else if (displayBracket !== undefined) { tex = displayBracket; display = true; }
+      else if (inlineParen !== undefined) { tex = inlineParen; display = false; }
+      else { tex = inlineDollar; display = false; }
+      const index = maths.push({ tex: tex.trim(), display }) - 1;
+      return `${prefix || ""}BM_MATH_${index}_TOKEN`;
+    },
+  );
   return { text, maths };
 }
 
@@ -2281,7 +2321,9 @@ function renderMarkdownPreview() {
   if (state.editor.composing) return;
   const preview = $("#markdownPreview");
   const source = stripFrontMatter($("#markdownSource").value);
-  const protectedSource = protectMath(source);
+  const codeProtected = protectCodeRegions(source);
+  const protectedSource = protectMath(codeProtected.text);
+  state.editor.codeTokens = codeProtected.codeTokens;
   let html;
   try {
     html = markdownRenderer
@@ -2295,6 +2337,7 @@ function renderMarkdownPreview() {
     const math = protectedSource.maths[index];
     return math ? `<span class="math-render" data-math-index="${index}" data-display="${math.display ? "1" : "0"}"></span>` : match;
   });
+  html = restoreCodeTokens(html, codeProtected.codeTokens);
   if (window.DOMPurify) html = window.DOMPurify.sanitize(html, { ADD_ATTR: ["data-math-index", "data-display"] });
   preview.innerHTML = html;
   const nodes = Array.from(preview.querySelectorAll(".math-render"));
@@ -2309,7 +2352,7 @@ function renderMarkdownPreview() {
   try {
     nodes.forEach((node) => {
       const math = protectedSource.maths[Number(node.dataset.mathIndex)];
-      window.katex.render(math.tex, node, { displayMode: Boolean(math.display), throwOnError: true, strict: false, trust: true });
+      window.katex.render(math.tex, node, { displayMode: Boolean(math.display), throwOnError: true, strict: false, trust: katexTrustPolicy });
     });
     $("#markdownPreviewMeta").textContent = "KaTeX 实时预览";
   } catch (_error) {

@@ -4,6 +4,7 @@ import argparse
 import copy
 import csv
 import io
+import ipaddress
 import json
 import locale
 import logging
@@ -21,7 +22,7 @@ import uuid
 import webbrowser
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,7 @@ POST_EXTENSIONS = {".md", ".markdown"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif", ".ico"}
 COVER_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 MAX_IMAGE_UPLOAD_MB = 20
+MAX_TASK_LINES = 5000
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 BROWSER_PIDS: list[int] = []
 BROWSER_LOCK = threading.RLock()
@@ -258,6 +260,10 @@ class SettingsStore:
 settings_store = SettingsStore(CONFIG_FILE, LEGACY_SETTINGS_FILE)
 app = Flask(__name__)
 app.json.ensure_ascii = False
+# 限制单个请求体大小，避免超大的 raw_yaml / 表单把内存或磁盘吃满。
+# 单张图片上限 20MB 且有张数可能较多，这里按 40MB 给一个宽松上限；
+# 超限时由 handle_payload_too_large 返回可读的 JSON 错误。
+app.config["MAX_CONTENT_LENGTH"] = 40 * 1024 * 1024
 
 
 def configure_application_logging() -> logging.Logger:
@@ -332,7 +338,15 @@ def plain_value(value: Any) -> Any:
         return {str(key): plain_value(item) for key, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [plain_value(item) for item in value]
-    if isinstance(value, (datetime, Path)):
+    if isinstance(value, datetime):
+        # 保持 "YYYY-MM-DD HH:mm:ss"，与前端 toDateInputValue / merge_date_time 一致
+        return value.strftime("%Y-%m-%d %H:%M:%S") if (value.hour or value.minute or value.second) else value.strftime("%Y-%m-%d")
+    if isinstance(value, date):
+        # 未加引号的 `date: 2024-01-01` 会被 ruamel 解析成 datetime.date；
+        # 若直接交给 jsonify，Flask 会用 http_date 渲染成 "Mon, 01 Jan 2024 00:00:00 GMT"，
+        # 前端无法回填，保存时就会把日期写空。
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, Path):
         return str(value)
     return value
 
@@ -866,7 +880,7 @@ def list_files(root: Path, extensions: set[str]) -> list[Path]:
     files: list[Path] = []
     for path in root.rglob("*"):
         try:
-            if path.is_file() and path.suffix.lower() in extensions and ".blogmanager-trash" not in path.parts:
+            if path.is_file() and path.suffix.lower() in extensions and TRASH_DIR_NAME not in path.parts:
                 files.append(path)
         except OSError:
             continue
@@ -1393,6 +1407,8 @@ class Task:
         self.ended_at: str | None = None
         self.lines: list[dict[str, Any]] = []
         self.events: list[dict[str, Any]] = []
+        self.next_seq = 0
+        self.output_truncated = False
         self.steps: list[dict[str, Any]] = []
         self.process: subprocess.Popen[str] | None = None
         self.pid: int | None = None
@@ -1414,7 +1430,7 @@ class Task:
         clean_text = ANSI_ESCAPE.sub("", str(text)).rstrip("\r\n")
         with self.condition:
             item = {
-                "seq": len(self.events) + 1,
+                "seq": self.emit_seq() + 1,
                 "type": "log",
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "level": level,
@@ -1422,7 +1438,21 @@ class Task:
             }
             self.events.append(item)
             self.lines.append(item)
+            self._trim_output()
             self.condition.notify_all()
+
+    def emit_seq(self) -> int:
+        """单调递增的序号。截断后不能用 len()，否则序号会倒退导致事件流重复发送。"""
+        self.next_seq += 1
+        return self.next_seq
+
+    def _trim_output(self) -> None:
+        """长时间任务会产生海量日志；保留最近 MAX_TASK_LINES 条，避免内存无限增长。"""
+        overflow = len(self.events) - MAX_TASK_LINES
+        if overflow > 0:
+            del self.events[:overflow]
+            del self.lines[:overflow]
+            self.output_truncated = True
 
     def emit_step(self, step_id: str, status: str, detail: str = "") -> None:
         with self.condition:
@@ -1434,7 +1464,7 @@ class Task:
                     break
             self.events.append(
                 {
-                    "seq": len(self.events) + 1,
+                    "seq": self.emit_seq() + 1,
                     "type": "step",
                     "time": datetime.now().strftime("%H:%M:%S"),
                     "id": step_id,
@@ -1442,6 +1472,7 @@ class Task:
                     "detail": detail,
                 }
             )
+            self._trim_output()
             self.condition.notify_all()
 
     def finish(self, status: str, exit_code: int | None = None) -> None:
@@ -1592,9 +1623,8 @@ def run_process(task: Task) -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            # 以字节读取再逐行解码：cmd.exe 在中文 Windows 上按 GBK 输出，
+            # 统一按 UTF-8 解码会把 "系统找不到指定的路径。" 变成 U+FFFD。
             bufsize=1,
             env=env,
             creationflags=NO_WINDOW,
@@ -1607,9 +1637,10 @@ def run_process(task: Task) -> None:
         assert process.stdout is not None
         output_tail: list[str] = []
         logged_output = 0
-        for raw_line in iter(process.stdout.readline, ""):
-            task.emit(raw_line)
-            cleaned = str(raw_line).strip()
+        for raw_line in iter(process.stdout.readline, b""):
+            line = decode_command_output(raw_line)
+            task.emit(line)
+            cleaned = str(line).strip()
             if cleaned:
                 output_tail.append(cleaned)
                 if len(output_tail) > 30:
@@ -1732,12 +1763,14 @@ def run_preview_process(task: Task) -> None:
     except (AutodeployError, ApiError) as exc:
         message = str(exc)
         task.error_message = message
+        LOGGER.error("task failed | kind=%s | id=%s | %s", task.kind, task.id, message)
         if task.status == "running":
             task.emit(message, "error")
             task.finish("failed", -1)
     except Exception as exc:
         message = str(exc)
         task.error_message = message
+        LOGGER.exception("task crashed | kind=%s | id=%s", task.kind, task.id)
         if task.status == "running":
             task.emit(f"本地预览启动异常：{message}", "error")
             task.finish("failed", -1)
@@ -1780,12 +1813,14 @@ def run_generate_process(task: Task) -> None:
     except (AutodeployError, ApiError) as exc:
         message = str(exc)
         task.error_message = message
+        LOGGER.error("task failed | kind=%s | id=%s | %s", task.kind, task.id, message)
         if task.status == "running":
             task.emit(message, "error")
             task.finish("failed", -1)
     except Exception as exc:
         message = str(exc)
         task.error_message = message
+        LOGGER.exception("task crashed | kind=%s | id=%s", task.kind, task.id)
         if task.status == "running":
             task.emit(f"强制重新生成异常：{message}", "error")
             task.finish("failed", -1)
@@ -1814,12 +1849,14 @@ def run_deploy_process(task: Task) -> None:
     except (AutodeployError, ApiError) as exc:
         message = str(exc)
         task.error_message = message
+        LOGGER.error("task failed | kind=%s | id=%s | %s", task.kind, task.id, message)
         if task.status == "running":
             task.emit(message, "error")
             task.finish("failed", -1)
     except Exception as exc:
         message = str(exc)
         task.error_message = message
+        LOGGER.exception("task crashed | kind=%s | id=%s", task.kind, task.id)
         if task.status == "running":
             task.emit(f"部署异常：{message}", "error")
             task.finish("failed", -1)
@@ -1937,6 +1974,51 @@ def open_preview_when_ready(task: Task) -> None:
                 task.emit(f"预览浏览器进程已记录：{', '.join(str(pid) for pid in new_pids)}", "muted")
     except Exception as exc:
         task.emit(f"无法自动打开浏览器：{exc}", "warning")
+
+
+LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "[::1]", "::1"}
+
+
+def host_without_port(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("["):  # IPv6 literal
+        end = text.find("]")
+        return text[: end + 1] if end > 0 else text
+    return text.split(":", 1)[0]
+
+
+def allowed_request_origins(host_header: str) -> set[str]:
+    """允许的来源集合，端口取自本次请求的 Host，避免依赖 WSGI 环境。"""
+    port = ""
+    text = str(host_header or "")
+    if text.startswith("["):
+        end = text.find("]")
+        port = text[end + 1 :] if end > 0 else ""
+    elif ":" in text:
+        port = text[text.rindex(":") :]
+    return {f"http://{host}{port}" for host in ("127.0.0.1", "localhost", "[::1]")}
+
+
+@app.before_request
+def guard_state_changing_requests() -> None:
+    """阻止恶意网页从浏览器向本机 127.0.0.1 发起跨站写操作与 DNS rebinding。
+
+    浏览器允许跨站发起 CORS 简单请求（表单、multipart），因此不校验来源时，
+    任意网页都可以 POST /api/posts、/api/images/upload 甚至 /api/app/exit。
+    """
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return
+    host_header = request.host
+    if host_without_port(host_header) not in LOCAL_HOSTNAMES:
+        raise ApiError("拒绝非本机来源的请求。", 403)
+    origin = request.headers.get("Origin")
+    if origin:
+        if origin.lower() not in allowed_request_origins(host_header):
+            raise ApiError("拒绝来自其他网站的跨站请求。", 403)
+        return
+    referer = request.headers.get("Referer")
+    if referer and host_without_port(urlparse(referer).netloc) not in LOCAL_HOSTNAMES:
+        raise ApiError("拒绝来自其他网站的跨站请求。", 403)
 
 
 @app.get("/")
@@ -2973,7 +3055,12 @@ def image_format_labels(allowed: set[str]) -> str:
 
 
 def safe_image_filename_ci(filename: str, allowed: set[str]) -> str:
-    """与 safe_image_filename 相同的规则，但扩展名大小写不敏感（拖拽常见 .JPG）。"""
+    """净化上传文件名并校验扩展名（大小写不敏感，可接受拖拽来的 .JPG）。
+
+    与 safe_image_filename 的差异：本函数由调用方显式传入 allowed 集合，
+    扩展名会先 lower 再比对，无法识别时抛出 415；safe_image_filename 默认
+    使用封面扩展名、默认 stem 为 cover、并返回 400。
+    """
     raw = Path(str(filename or "")).name
     suffix = Path(raw).suffix.lower()
     if suffix not in allowed:
@@ -3101,13 +3188,41 @@ def api_upload_image() -> Response:
     return jsonify({"ok": True, "image": result["image"]}), 201
 
 
+def assert_public_http_url(url: str) -> None:
+    """拒绝指向本机/内网/保留地址的图片 URL，避免被用作内网探测（SSRF）。"""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ApiError("请输入有效的 http 或 https 图片 URL。")
+    host = parsed.hostname or ""
+    if not host:
+        raise ApiError("请输入有效的 http 或 https 图片 URL。")
+    if host.lower() in {"localhost", "localhost.localdomain"} or host.lower().endswith(".localhost"):
+        raise ApiError("出于安全考虑，不能从本机地址下载图片。", 403)
+    try:
+        addresses = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            addresses = [ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, None)]
+        except (OSError, ValueError):
+            raise ApiError(f"无法解析该域名：{host}", 502) from None
+    for address in addresses:
+        if (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            raise ApiError("出于安全考虑，不能从本机或内网地址下载图片。", 403)
+
+
 @app.post("/api/images/from-url")
 def api_image_from_url() -> Response:
     payload = json_payload()
     url = normalize_text(payload.get("url"), "图片 URL")
+    assert_public_http_url(url)
     parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ApiError("请输入有效的 http 或 https 图片 URL。")
     request_obj = Request(url, headers={"User-Agent": "BlogManager/1.0", "Accept": "image/*"}, method="GET")
     try:
         with urlopen(request_obj, timeout=20) as response:
@@ -3121,6 +3236,8 @@ def api_image_from_url() -> Response:
         ) from exc
     if len(data) > 25 * 1024 * 1024:
         raise ApiError("图片超过 25 MB，建议压缩后再上传。", 413, {"url": url, "download_failed": True})
+    if not data:
+        raise ApiError("下载到的文件为空，请检查该 URL。", 400, {"url": url, "download_failed": True})
     scope = str(payload.get("scope", "cover") or "cover").strip().lower()
     allowed_extensions = IMAGE_EXTENSIONS if scope in {"config", "all"} else COVER_IMAGE_EXTENSIONS
     mime_suffixes = {
@@ -3248,9 +3365,7 @@ def run_task_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        # 字节读取后逐行解码，兼容 cmd.exe / git 在中文 Windows 上的 GBK 输出
         bufsize=1,
         env=env,
         creationflags=NO_WINDOW,
@@ -3263,7 +3378,8 @@ def run_task_command(
     assert process.stdout is not None
     output_tail: list[str] = []
     logged_output = 0
-    for line in iter(process.stdout.readline, ""):
+    for raw_line in iter(process.stdout.readline, b""):
+        line = decode_command_output(raw_line)
         task.emit(line)
         cleaned = str(line).strip()
         if cleaned:
@@ -3367,6 +3483,11 @@ def parse_github_repo(repo_url: str) -> tuple[str, str] | None:
 
 
 def github_api_json(method: str, url: str, token: str, payload: dict[str, Any] | None = None) -> tuple[int, Any]:
+    # token 含换行等非法字符时，http.client 抛出的 ValueError 会把整个
+    # "Bearer <token>" 写进异常消息，进而进入持久日志与 500 响应体。
+    # 这里提前用白名单拒掉，且绝不回显 token 本身。
+    if token and not re.fullmatch(r"[A-Za-z0-9_\-]+", token):
+        raise ApiError("GitHub Token 格式非法：只允许字母、数字、下划线和连字符。", 400)
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
@@ -3391,6 +3512,11 @@ def github_api_json(method: str, url: str, token: str, payload: dict[str, Any] |
         return exc.code, body
     except (URLError, TimeoutError, OSError) as exc:
         raise ApiError(f"无法连接 GitHub API：{exc}", 502) from exc
+    except ValueError as exc:
+        # 双保险：任何 header/参数格式错误都不回显原始内容（可能含 token）
+        raise ApiError("GitHub API 请求格式非法，请检查 Token 与仓库地址。", 400) from None
+    except UnicodeEncodeError as exc:
+        raise ApiError("GitHub Token 含无法发送的字符，请重新填写。", 400) from None
 
 
 def ensure_github_repository(repo_url: str, token: str, private: bool) -> dict[str, Any]:
@@ -3460,8 +3586,9 @@ def autodeploy_defaults() -> dict[str, Any]:
         if isinstance(deploy, Mapping):
             defaults["repo_url"] = str(deploy.get("repo", "") or defaults["repo_url"])
             defaults["branch"] = str(deploy.get("branch", "") or defaults["branch"])
-    except Exception:
-        pass
+    except Exception as exc:
+        # _config.yml 损坏时向导会显示空标题/空仓库地址，必须留下日志线索
+        LOGGER.warning("autodeploy defaults fallback | %s", exc)
     if not defaults["repo_url"] and defaults["url"]:
         defaults["repo_url"] = infer_repo_url(str(defaults["url"]))
     return defaults
@@ -3573,6 +3700,12 @@ def validate_autodeploy_payload(payload: dict[str, Any]) -> dict[str, Any]:
     for value, label in ((repo_url, "仓库地址"), (theme_repo, "主题仓库")):
         if value and any(char in value for char in ('\n', '\r', '&', '|', '<', '>')):
             raise ApiError(f"{label}包含不安全字符。")
+        # 带 userinfo 的 HTTPS 地址会把 PAT 明文写进博客 _config.yml 并可能被提交
+        if value and urlparse(value).username:
+            raise ApiError(
+                f"{label}不能包含用户名或 Token（如 https://token@github.com/...）。"
+                "请改用 SSH 地址 git@github.com:用户名/仓库.git。"
+            )
     if not local_only and not repo_url:
         raise ApiError("请填写 GitHub 仓库地址。")
     if not re.fullmatch(r"[A-Za-z0-9._/-]+", branch):
@@ -4068,11 +4201,13 @@ def run_dependency_repair(task: Task, target: Path) -> None:
     except (AutodeployError, ApiError) as exc:
         message = str(exc)
         task.error_message = message
+        LOGGER.error("task failed | kind=%s | id=%s | %s", task.kind, task.id, message)
         task.emit(message, "error")
         task.finish("failed", -1)
     except Exception as exc:
         message = str(exc)
         task.error_message = message
+        LOGGER.exception("task crashed | kind=%s | id=%s", task.kind, task.id)
         task.emit(f"依赖修复异常：{message}", "error")
         task.finish("failed", -1)
 
@@ -4258,8 +4393,10 @@ def run_autodeploy(task: Task, options: dict[str, Any]) -> None:
             if current_step:
                 task.emit_step(current_step, "failed", "用户取消部署")
             task.emit("自动部署已取消。", "warning")
+            LOGGER.warning("autodeploy cancelled | id=%s | step=%s", task.id, current_step)
             task.finish("stopped", None)
             return
+        LOGGER.error("autodeploy failed | id=%s | step=%s | %s", task.id, current_step, message)
         if current_step:
             task.emit_step(current_step, "failed", message)
         task.emit(message, "error")
@@ -4273,8 +4410,10 @@ def run_autodeploy(task: Task, options: dict[str, Any]) -> None:
             if current_step:
                 task.emit_step(current_step, "failed", "用户取消部署")
             task.emit("自动部署已取消。", "warning")
+            LOGGER.warning("autodeploy cancelled | id=%s | step=%s", task.id, current_step)
             task.finish("stopped", None)
             return
+        LOGGER.exception("autodeploy crashed | id=%s | step=%s", task.id, current_step)
         if current_step:
             task.emit_step(current_step, "failed", message)
         task.emit(f"自动部署异常：{message}", "error")
@@ -4484,9 +4623,11 @@ def run_clone_blog(task: Task, target: Path, repo_url: str, branch: str) -> None
         task.emit("远程博客克隆完成，已切换到该目录。", "success")
         task.finish("success", 0)
     except (AutodeployError, ApiError) as exc:
+        LOGGER.error("task failed | kind=%s | id=%s | %s", task.kind, task.id, exc)
         task.emit(str(exc), "error")
         task.finish("failed", -1)
     except Exception as exc:
+        LOGGER.exception("task crashed | kind=%s | id=%s", task.kind, task.id)
         task.emit(f"克隆异常：{exc}", "error")
         task.finish("failed", -1)
 
