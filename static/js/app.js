@@ -48,7 +48,7 @@ const state = {
   allowUnload: false,
   posts: [],
   postFolder: "",
-  frontmatter: { selectedPath: "", properties: [], invalid: false, loading: false },
+  frontmatter: { selectedPath: "", properties: [], invalid: false, loading: false, loadToken: 0 },
   cover: { relativePath: "", currentCover: "", selectedValue: "", externalValue: "", newImages: new Set(), properties: [], loadToken: 0 },
   postFoldersExpanded: new Set([""]),
   postSelection: { active: false, selected: new Set(), visiblePaths: [] },
@@ -56,7 +56,7 @@ const state = {
   previewDependencies: null,
   images: [],
   imageViewer: { relativePath: "", name: "", url: "", size: 0, width: 0, height: 0, scale: 1, rotation: 0, x: 0, y: 0, dragging: false, startX: 0, startY: 0, originX: 0, originY: 0 },
-  editor: { relativePath: "", content: "", original: "", dirty: false, renderTimer: null, composing: false, codeTokens: [] },
+  editor: { relativePath: "", content: "", original: "", dirty: false, renderTimer: null, composing: false, codeTokens: [], highlightPending: false },
   configImage: { kind: "", path: "", selected: "", external: "", images: [], newImages: new Set(), loadToken: 0 },
   site: {
     loaded: false,
@@ -2014,6 +2014,10 @@ function renderFrontmatterPostList() {
 }
 
 async function selectFrontmatterPost(relativePath) {
+  // loadToken 防止"先点 A 再点 B"时 A 的响应后到、把 A 的属性覆盖到 B 的文章上：
+  // 保存用的是 state.frontmatter.selectedPath，属性却来自最后一次到货的响应。
+  const loadToken = state.frontmatter.loadToken + 1;
+  state.frontmatter.loadToken = loadToken;
   state.frontmatter.selectedPath = relativePath;
   state.frontmatter.loading = true;
   renderFrontmatterPostList();
@@ -2023,6 +2027,7 @@ async function selectFrontmatterPost(relativePath) {
   $("#frontmatterSaveHint").textContent = "正在加载...";
   try {
     const data = await api(`/api/posts/frontmatter?relative_path=${encodeURIComponent(relativePath)}`, { cache: "no-store" });
+    if (state.frontmatter.loadToken !== loadToken) return; // 已被更新的选择取代，丢弃过期响应
     state.frontmatter.properties = Array.isArray(data.properties) ? data.properties : [];
     state.frontmatter.invalid = Boolean(data.invalid);
     const warning = $("#frontmatterWarning");
@@ -2032,6 +2037,7 @@ async function selectFrontmatterPost(relativePath) {
     renderFrontmatterProperties();
     $("#frontmatterSaveHint").textContent = data.invalid ? "front-matter 无效，暂不能保存。" : "已加载";
   } catch (error) {
+    if (state.frontmatter.loadToken !== loadToken) return;
     state.frontmatter.properties = [];
     state.frontmatter.invalid = true;
     $("#saveFrontmatterButton").disabled = true;
@@ -2039,7 +2045,7 @@ async function selectFrontmatterPost(relativePath) {
     $("#frontmatterSaveHint").textContent = error.message;
     toast("无法读取 front-matter", error.message, "error");
   } finally {
-    state.frontmatter.loading = false;
+    if (state.frontmatter.loadToken === loadToken) state.frontmatter.loading = false;
   }
 }
 
@@ -2062,9 +2068,16 @@ function closeFrontmatterEditor() {
 }
 
 async function saveFrontmatter() {
-  if (!state.frontmatter.selectedPath) return;
+  const targetPath = state.frontmatter.selectedPath;
+  if (!targetPath) return;
   if (state.frontmatter.invalid) {
     toast("无法保存", "当前 front-matter YAML 格式无效，请先在 Markdown 编辑器中修复。", "error", 7000);
+    return;
+  }
+  // 属性必须与目标文章一致：若选择已切换（或仍在加载），说明表单里的属性
+  // 属于另一篇文章，直接放弃而不是把它写进 targetPath。
+  if (state.frontmatter.loading || state.frontmatter.selectedPath !== targetPath) {
+    toast("请先等待属性加载完成", "文章已切换，请重新确认属性后再保存。", "warning", 6000);
     return;
   }
   const properties = collectFrontmatterProperties();
@@ -2079,7 +2092,7 @@ async function saveFrontmatter() {
   try {
     const data = await api("/api/posts/frontmatter", {
       method: "POST",
-      body: JSON.stringify({ relative_path: state.frontmatter.selectedPath, properties }),
+      body: JSON.stringify({ relative_path: targetPath, properties }),
     });
     state.frontmatter.properties = data.properties || [];
     state.frontmatter.invalid = false;
@@ -2087,7 +2100,7 @@ async function saveFrontmatter() {
     $("#saveFrontmatterButton").disabled = false;
     renderFrontmatterProperties();
     $("#frontmatterSaveHint").textContent = "已保存";
-    toast("文章属性已保存", state.frontmatter.selectedPath, "success");
+    toast("文章属性已保存", targetPath, "success");
     await loadPosts({ quiet: true });
     renderFrontmatterPostList();
   } catch (error) {
@@ -2122,9 +2135,24 @@ function highlightMarkdown(source) {
   return html;
 }
 
+// 语法高亮是整篇文档的 8 次正则 + 一次大段 innerHTML 重建。超大文档下这会
+// 让每次按键都卡顿数百毫秒，因此超过阈值就退化成"仅转义"的纯文本高亮层。
+const MARKDOWN_HIGHLIGHT_MAX_CHARS = 300000;
+const MARKDOWN_HIGHLIGHT_MAX_LINES = 20000;
+
+function applyMarkdownHighlight(text) {
+  const tooLarge = text.length > MARKDOWN_HIGHLIGHT_MAX_CHARS;
+  const highlight = $("#markdownHighlight");
+  highlight.innerHTML = tooLarge ? escapeHtml(text) : highlightMarkdown(text);
+  highlight.dataset.plain = tooLarge ? "1" : "";
+  const meta = $("#markdownPreviewMeta");
+  if (tooLarge && meta) meta.textContent = "文档较大，已关闭语法着色以保证输入流畅";
+}
+
 function updateMarkdownLineNumbers() {
-  const source = $("#markdownSource").value;
-  const count = Math.max(1, source.split("\n").length);
+  const source = $("#markdownSource");
+  // split 只为拿行数，超大文档用换行计数避免额外分配一份全文数组
+  const count = Math.max(1, (source.value.match(/\n/g) || []).length + 1);
   const numbers = $("#markdownLineNumbers");
   if (numbers.dataset.lineCount === String(count)) return;
   numbers.textContent = Array.from({ length: count }, (_item, index) => index + 1).join("\n");
@@ -2138,6 +2166,28 @@ function syncMarkdownScroll() {
   $("#markdownLineNumbers").scrollTop = source.scrollTop;
 }
 
+// 高亮层刷新只在同一帧内合并一次：IME 合成期间也要刷新，否则 textarea 的文字
+// 是透明的（颜色由高亮层提供），用户会看不到正在输入的拼音/候选内容。
+function scheduleMarkdownHighlight() {
+  if (state.editor.highlightPending) return;
+  state.editor.highlightPending = true;
+  requestAnimationFrame(() => {
+    state.editor.highlightPending = false;
+    if (!state.editor.relativePath) return;
+    const source = $("#markdownSource");
+    const hasFocus = document.activeElement === source;
+    const selectionStart = hasFocus ? source.selectionStart : null;
+    const selectionEnd = hasFocus ? source.selectionEnd : null;
+    applyMarkdownHighlight(state.editor.content);
+    updateMarkdownLineNumbers();
+    if (hasFocus && document.activeElement === source
+        && (source.selectionStart !== selectionStart || source.selectionEnd !== selectionEnd)) {
+      source.setSelectionRange(selectionStart, selectionEnd);
+    }
+    syncMarkdownScroll();
+  });
+}
+
 async function openPost(relativePath) {
   try {
     const data = await api(`/api/posts/content?relative_path=${encodeURIComponent(relativePath)}`, { cache: "no-store" });
@@ -2148,7 +2198,7 @@ async function openPost(relativePath) {
     $("#markdownTitle").textContent = relativePath.split("/").pop() || "文章编辑";
     $("#markdownPath").textContent = data.relative_path;
     $("#markdownSource").value = data.content;
-    $("#markdownHighlight").innerHTML = highlightMarkdown(data.content);
+    applyMarkdownHighlight(data.content);
     $("#markdownStatus").textContent = "已加载";
     $("#markdownStatus").className = "markdown-status";
     updateMarkdownLineNumbers();
@@ -2185,6 +2235,9 @@ async function saveMarkdownPost() {
 
 function closeMarkdownEditor() {
   if (state.editor.dirty && !window.confirm("文章有未保存修改，确定关闭吗？")) return;
+  // 关闭时复位编辑状态，避免合成中途关闭导致 composing 永久为真
+  state.editor.composing = false;
+  clearTimeout(state.editor.renderTimer);
   $("#markdownDialog").close();
 }
 
@@ -2318,7 +2371,12 @@ async function renderWithMathJax(html, maths) {
 }
 
 function renderMarkdownPreview() {
-  if (state.editor.composing) return;
+  // IME 合成过程中不重排预览：高亮层已由 refreshMarkdownEditorView 更新，
+  // 足够让用户看到拼音/候选字，同时避免打断连打体验。
+  if (state.editor.composing) {
+    scheduleMarkdownPreview();
+    return;
+  }
   const preview = $("#markdownPreview");
   const source = stripFrontMatter($("#markdownSource").value);
   const codeProtected = protectCodeRegions(source);
@@ -2367,21 +2425,15 @@ function scheduleMarkdownPreview() {
 }
 
 function refreshMarkdownEditorView() {
-  if (state.editor.composing) return;
   const source = $("#markdownSource");
-  const hasFocus = document.activeElement === source;
-  const selectionStart = hasFocus ? source.selectionStart : null;
-  const selectionEnd = hasFocus ? source.selectionEnd : null;
   state.editor.content = source.value;
   state.editor.dirty = state.editor.content !== state.editor.original;
   $("#markdownStatus").textContent = state.editor.dirty ? "未保存" : "已加载";
   $("#markdownStatus").className = `markdown-status ${state.editor.dirty ? "dirty" : ""}`;
-  $("#markdownHighlight").innerHTML = highlightMarkdown(state.editor.content);
-  updateMarkdownLineNumbers();
-  if (hasFocus && document.activeElement === source && (source.selectionStart !== selectionStart || source.selectionEnd !== selectionEnd)) {
-    source.setSelectionRange(selectionStart, selectionEnd);
-  }
-  syncMarkdownScroll();
+  // 高亮层必须刷新（含 IME 合成期间），否则透明 textarea 上的文字不可见；
+  // 预览渲染则继续延后，避免在合成期间被重排打断。
+  scheduleMarkdownHighlight();
+  if (state.editor.composing) return;
   scheduleMarkdownPreview();
 }
 
@@ -4011,7 +4063,8 @@ function bindEvents() {
     state.editor.dirty = state.editor.content !== state.editor.original;
     $("#markdownStatus").textContent = state.editor.dirty ? "未保存" : "已加载";
     $("#markdownStatus").className = `markdown-status ${state.editor.dirty ? "dirty" : ""}`;
-    if (state.editor.composing) return;
+    // 不再在 composing 时直接 return：那样高亮层会整段停止更新，
+    // 而 textarea 文字是透明的，用户会看不到正在输入的拼音/候选字。
     refreshMarkdownEditorView();
   });
   $("#markdownSource").addEventListener("compositionstart", () => {
@@ -4026,6 +4079,10 @@ function bindEvents() {
       });
     });
   });
+  // composing 只在 compositionend 里清除；若该事件丢失（系统 IME 异常、
+  // 合成中途关闭对话框），标志会永久为真并让编辑器表现异常，因此在失焦和
+  // 关闭编辑器时兜底复位。
+  $("#markdownSource").addEventListener("blur", () => { state.editor.composing = false; });
   $("#markdownSource").addEventListener("scroll", syncMarkdownScroll);
   $("#markdownSource").addEventListener("keydown", (event) => {
     if (event.isComposing || state.editor.composing) return;
@@ -4156,6 +4213,19 @@ function clearAllDropHighlights() {
   $$(".drop-overlay.visible").forEach((overlay) => overlay.classList.remove("visible"));
 }
 
+// 心跳必须无条件注册：之前只在 loadStatus() 成功后注册，一旦首次状态请求失败，
+// 后端就再也收不到心跳，会在看门狗超时后自行退出（连带杀掉正在跑的任务）。
+function startClientHeartbeat() {
+  const ping = () => api("/api/client/ping", { method: "POST", body: "{}" }).catch(() => {});
+  ping();
+  setInterval(ping, 3000);
+  // 窗口重新可见/获得焦点时立刻补一次心跳：后台标签会被浏览器节流到约 1 次/分钟，
+  // 系统休眠唤醒后也需要尽快刷新 last_seen，避免看门狗误判。
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) ping(); });
+  window.addEventListener("focus", ping);
+  window.addEventListener("pageshow", ping);
+}
+
 async function init() {
   initPanelTheme();
   updateHighlightTheme();
@@ -4164,14 +4234,13 @@ async function init() {
   $("#previewPort").value = savedPort;
   $(".preview-card .command-line").innerHTML = previewCommandMarkup(savedPort);
   bindEvents();
-  try { await api("/api/client/ping", { method: "POST", body: "{}" }); } catch (_error) { /* 服务可能正在启动 */ }
+  startClientHeartbeat();
   try {
     await loadStatus({ attachPreview: true });
     if (state.status?.cleanup_warning?.failed_browsers?.length) {
       const failed = state.status.cleanup_warning.failed_browsers.join(", ");
       toast("上次退出有进程未清理", `残留浏览器 PID：${failed}。可手动执行 taskkill /PID <pid> /T /F。`, "warning", 12000);
     }
-    setInterval(() => api("/api/client/ping", { method: "POST", body: "{}" }).catch(() => {}), 3000);
   } catch (error) {
     $("#serverDot").className = "status-dot error";
     $("#serverLabel").textContent = "服务连接失败";

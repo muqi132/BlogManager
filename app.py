@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 import webbrowser
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
@@ -75,7 +75,12 @@ MAX_TASK_LINES = 5000
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 BROWSER_PIDS: list[int] = []
 BROWSER_LOCK = threading.RLock()
-CLIENT_STATE = {"last_seen": time.time(), "active": False, "goodbye_at": 0.0, "generation": 0}
+CLIENT_STATE = {"last_seen": time.monotonic(), "active": False, "goodbye_at": 0.0, "generation": 0}
+# 客户端心跳判定。用 time.monotonic 而不是 time.time，避免墙钟被 NTP 校正或
+# 系统休眠唤醒后跳变，导致"看似很久没心跳"而误杀正在跑的自动部署。
+CLIENT_IDLE_TIMEOUT = 90.0
+CLIENT_WATCHDOG_INTERVAL = 10.0
+CLIENT_WATCHDOG_STARTUP_GRACE = 60.0
 CLIENT_LOCK = threading.RLock()
 SHUTTING_DOWN = False
 
@@ -144,7 +149,7 @@ class SettingsStore:
         if self.path.exists() or not self.legacy_path or not self.legacy_path.exists():
             return
         try:
-            payload = json.loads(self.legacy_path.read_text(encoding="utf-8"))
+            payload = json.loads(self.legacy_path.read_text(encoding="utf-8-sig"))
             if not isinstance(payload, dict):
                 return
             payload["config_version"] = int(payload.get("config_version", 1) or 1)
@@ -166,8 +171,11 @@ class SettingsStore:
         if not self.path.exists():
             return result
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            # utf-8-sig：用户在记事本里"另存为 UTF-8"会写入 BOM，
+            # 而 json.loads 默认拒绝 BOM，会导致整份配置被静默丢弃。
+            payload = json.loads(self.path.read_text(encoding="utf-8-sig"))
             if not isinstance(payload, dict):
+                LOGGER.warning("config.json 根节点不是对象，已回退默认配置 | %s", self.path)
                 return result
             result["config_version"] = int(payload.get("config_version", 1) or 1)
             result["onboarding_complete"] = bool(
@@ -182,7 +190,13 @@ class SettingsStore:
             if isinstance(payload.get("autodeploy"), dict):
                 result["autodeploy"] = copy.deepcopy(payload["autodeploy"])
             result["github"] = normalize_github_settings(payload.get("github"))
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError) as exc:
+            # 原来是静默 return：配置损坏时用户会突然回到首次运行界面，
+            # 并且已保存的 GitHub Token 看起来"消失"了，却没有任何线索。
+            LOGGER.error(
+                "config.json 读取失败，已回退默认配置（原文件保留未删除）| %s | %s",
+                self.path, exc,
+            )
             return default_runtime_config()
         return result
 
@@ -1382,6 +1396,47 @@ def move_post_to_trash(root: Path, path: Path) -> tuple[Path, dict[str, Any]]:
     return target, cleanup_trash(trash)
 
 
+def atomic_write_bytes(path: Path, data: bytes, error_prefix: str = "写入失败") -> None:
+    """先写临时文件再 os.replace，避免进程被强制结束时留下被截断的文件。
+
+    cleanup_runtime 会调用 os._exit(0)，它不会等待其它线程的写操作落盘，
+    因此所有"覆盖已有文件"的写入都必须是原子的。
+    """
+    temp_path = path.with_suffix(path.suffix + ".blogmanager.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_bytes(data)
+        os.replace(temp_path, path)
+    except OSError as exc:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ApiError(f"{error_prefix}：{exc}") from exc
+
+
+def atomic_write_text(path: Path, text: str, error_prefix: str = "写入失败") -> None:
+    """以 UTF-8 + LF 原子写入文本。"""
+    atomic_write_bytes(path, text.replace("\r\n", "\n").encode("utf-8"), error_prefix)
+
+
+def cleanup_stale_temp_files(root: Path) -> int:
+    """启动时清理上次异常退出遗留的 *.blogmanager.tmp。"""
+    removed = 0
+    if not root.exists():
+        return removed
+    for path in root.rglob("*.blogmanager.tmp"):
+        try:
+            if path.is_file():
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        LOGGER.info("cleaned stale temp files | count=%s | root=%s", removed, root)
+    return removed
+
+
 def safe_filename(title: str, filename: str = "") -> str:
     raw = normalize_text(filename, "文件名") or normalize_text(title, "标题") or "untitled"
     raw = Path(raw).name
@@ -1510,13 +1565,39 @@ class TaskManager:
         self.lock = threading.RLock()
 
     def create(self, kind: str, command: str, cwd: Path, port: int | None = None) -> Task:
-        task = Task(kind, command, cwd, port)
         with self.lock:
-            self.tasks[task.id] = task
-            if len(self.tasks) > 30:
-                completed = [item for item in self.tasks.values() if item.status != "running"]
-                for old_task in completed[: max(0, len(self.tasks) - 30)]:
-                    self.tasks.pop(old_task.id, None)
+            return self._create_locked(kind, command, cwd, port)
+
+    def create_if_idle(
+        self,
+        kind: str,
+        command: str,
+        cwd: Path,
+        port: int | None = None,
+        kinds: tuple[str, ...] | None = None,
+    ) -> tuple[Task, bool]:
+        """原子地"检查同 kind 是否在跑 + 创建"。
+
+        检查与创建必须在同一把锁内，否则双击按钮/两个标签页同时请求时，
+        两个请求都会看到"没有运行中的任务"而各自创建一个，导致同一博客目录
+        并发执行 hexo clean/generate、互删 public 并抢同一端口。
+
+        返回 (task, created)。created 为 False 时 task 是已在运行的那个。
+        """
+        wanted = kinds or (kind,)
+        with self.lock:
+            for task in reversed(list(self.tasks.values())):
+                if task.kind in wanted and task.status == "running":
+                    return task, False
+            return self._create_locked(kind, command, cwd, port), True
+
+    def _create_locked(self, kind: str, command: str, cwd: Path, port: int | None) -> Task:
+        task = Task(kind, command, cwd, port)
+        self.tasks[task.id] = task
+        if len(self.tasks) > 30:
+            completed = [item for item in self.tasks.values() if item.status != "running"]
+            for old_task in completed[: max(0, len(self.tasks) - 30)]:
+                self.tasks.pop(old_task.id, None)
         return task
 
     def get(self, task_id: str) -> Task:
@@ -1862,29 +1943,22 @@ def run_deploy_process(task: Task) -> None:
             task.finish("failed", -1)
 
 
-def start_process_task(kind: str, cwd: Path, port: int | None = None) -> Task:
-    if kind == "preview":
-        port = validate_port(port or 4000)
-        command_text = f"hexo clean\nhexo generate\nhexo server -p {port}"
-        task = task_manager.create(kind, command_text, cwd, port)
-        task.command_args = command_for("preview", port, cwd)[1]
-        threading.Thread(target=run_preview_process, args=(task,), daemon=True).start()
-        return task
-    if kind == "deploy":
-        task = task_manager.create(kind, "hexo clean && hexo deploy", cwd)
-        threading.Thread(target=run_deploy_process, args=(task,), daemon=True).start()
-        return task
-    command_text, command_args = command_for(kind, port, cwd)
-    task = task_manager.create(kind, command_text, cwd, port)
-    task.command_args = command_args
-    threading.Thread(target=run_process, args=(task,), daemon=True).start()
-    return task
-
-
-def start_generate_task(cwd: Path) -> Task:
-    task = task_manager.create("generate", "hexo clean && hexo generate", cwd)
-    threading.Thread(target=run_generate_process, args=(task,), daemon=True).start()
-    return task
+def start_runner_task(
+    kind: str,
+    command: str,
+    cwd: Path,
+    runner: Callable[[Task], None],
+    port: int | None = None,
+    command_args: list[str] | None = None,
+) -> tuple[Task, bool]:
+    """原子地创建任务并启动对应 runner，返回 (task, created)。"""
+    task, created = task_manager.create_if_idle(kind, command, cwd, port)
+    if not created:
+        return task, False
+    if command_args is not None:
+        task.command_args = command_args
+    threading.Thread(target=runner, args=(task,), daemon=True).start()
+    return task, True
 
 
 def terminate_process_tree(process: subprocess.Popen[str]) -> None:
@@ -1920,7 +1994,7 @@ def wait_for_task_stopped(task: Task, timeout: float = 8.0) -> bool:
         process = task.process
         if task.port and port_is_occupied(task.port):
             if not port_cleanup_attempted:
-                terminate_port_processes(task.port)
+                terminate_port_processes(task.port, task)
                 port_cleanup_attempted = True
             time.sleep(0.25)
             continue
@@ -1942,7 +2016,13 @@ def stop_task(task: Task, announce: bool = True) -> None:
     if task.process is not None:
         terminate_process_tree(task.process)
     if task.port:
-        terminate_port_processes(task.port)
+        _killed, skipped = terminate_port_processes(task.port, task)
+        if skipped:
+            task.emit(
+                f"端口 {task.port} 仍被进程 {'、'.join(str(item) for item in skipped)} 占用，"
+                "但无法确认它是否由本程序启动，已跳过以免误杀。请手动确认后结束该进程。",
+                "warning",
+            )
 
 def open_preview_when_ready(task: Task) -> None:
     deadline = time.time() + 45
@@ -2623,15 +2703,17 @@ def api_preview_dependencies() -> Response:
 @app.post("/api/commands/deploy")
 def api_deploy() -> Response:
     cwd = require_blog_directory()
-    if task_manager.running("deploy"):
-        raise ApiError("已有部署任务正在运行。", 409)
-    task = start_process_task("deploy", cwd)
+    task, created = start_runner_task(
+        "deploy", "hexo clean && hexo deploy", cwd, run_deploy_process
+    )
+    if not created:
+        raise ApiError("已有部署任务正在运行，请等待它结束或先停止它。", 409, {"task": task.snapshot()})
     return jsonify({"task": task.snapshot()}), 202
-
 
 @app.post("/api/commands/preview")
 def api_preview() -> Response:
     cwd = require_blog_directory()
+    # 先停掉旧预览；随后用 create_if_idle 原子创建，避免并发请求各起一个预览
     running = task_manager.running("preview")
     if running:
         stop_task(running)
@@ -2656,7 +2738,16 @@ def api_preview() -> Response:
             409,
             {"port": port, "suggested_port": suggest_preview_port(port)},
         )
-    task = start_process_task("preview", cwd, port)
+    task, created = start_runner_task(
+        "preview",
+        f"hexo clean\nhexo generate\nhexo server -p {port}",
+        cwd,
+        run_preview_process,
+        port,
+        command_args=command_for("preview", port, cwd)[1],
+    )
+    if not created:
+        raise ApiError("已有预览任务正在运行。", 409, {"task": task.snapshot()})
     threading.Thread(target=open_preview_when_ready, args=(task,), daemon=True).start()
     return jsonify({"task": task.snapshot()}), 202
 
@@ -2664,26 +2755,26 @@ def api_preview() -> Response:
 @app.post("/api/dependencies/repair")
 def api_repair_dependencies() -> Response:
     cwd = require_blog_directory()
-    running = task_manager.running("dependencies")
-    if running:
-        return jsonify({"task": running.snapshot(), "already_running": True}), 200
-    task = task_manager.create(
+    task, created = start_runner_task(
         "dependencies",
         "npm install hexo-renderer-pug hexo-renderer-stylus --save && hexo clean && hexo generate",
         cwd,
+        lambda item: run_dependency_repair(item, cwd),
     )
+    if not created:
+        return jsonify({"task": task.snapshot(), "already_running": True}), 200
     task.options = {"target": cwd}
-    threading.Thread(target=run_dependency_repair, args=(task, cwd), daemon=True).start()
     return jsonify({"task": task.snapshot()}), 202
 
 
 @app.post("/api/commands/generate")
 def api_generate() -> Response:
     cwd = require_blog_directory()
-    running = task_manager.running("generate")
-    if running:
-        return jsonify({"task": running.snapshot(), "already_running": True}), 200
-    task = start_generate_task(cwd)
+    task, created = start_runner_task(
+        "generate", "hexo clean && hexo generate", cwd, run_generate_process
+    )
+    if not created:
+        return jsonify({"task": task.snapshot(), "already_running": True}), 200
     return jsonify({"task": task.snapshot()}), 202
 
 
@@ -2895,9 +2986,9 @@ def api_create_post() -> Response:
     stream = io.StringIO()
     yaml.dump(metadata, stream)
     try:
-        path.write_text(f"---\n{stream.getvalue()}---\n\n", encoding="utf-8", newline="\n")
-    except OSError as exc:
-        raise ApiError(f"无法创建文章，请检查目录写权限：{exc}") from exc
+        atomic_write_text(path, f"---\n{stream.getvalue()}---\n\n", "无法创建文章，请检查目录写权限")
+    except ApiError:
+        raise
     return jsonify({"ok": True, "relative_path": path.relative_to(root).as_posix()}), 201
 
 
@@ -3265,10 +3356,7 @@ def api_image_from_url() -> Response:
     root = require_blog_directory() / "source" / "img"
     root.mkdir(parents=True, exist_ok=True)
     target = unique_image_target(root, filename)
-    try:
-        target.write_bytes(data)
-    except OSError as exc:
-        raise ApiError(f"保存下载图片失败：{exc}") from exc
+    atomic_write_bytes(target, data, "保存下载图片失败")
     return jsonify({"ok": True, "image": image_payload(target, root)}), 201
 
 
@@ -3838,9 +3926,10 @@ def remove_conflicting_mathjax_plugin(target: Path, task: Task) -> None:
                     dependencies.pop("hexo-filter-mathjax", None)
                     removed = True
             if removed:
-                package_path.write_text(
+                atomic_write_text(
+                    package_path,
                     json.dumps(package_data, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
+                    "写入 package.json 失败",
                 )
                 task.emit("已从 package.json 移除冲突插件 hexo-filter-mathjax。", "success")
 
@@ -4128,7 +4217,11 @@ $$
 
 更多信息请访问 [Hexo 官网](https://hexo.io/)。
 '''
-    welcome_path.write_text(f"---\n{stream.getvalue()}---\n\n{body}", encoding="utf-8", newline="\n")
+    atomic_write_text(
+        welcome_path,
+        f"---\n{stream.getvalue()}---\n\n{body}",
+        "写入欢迎文章失败",
+    )
     task.emit("已创建欢迎文章 welcome.md", "success")
     return True
 
@@ -4231,9 +4324,34 @@ def run_autodeploy(task: Task, options: dict[str, Any]) -> None:
         def step_enabled(step_id: str) -> bool:
             return step_ids.index(step_id) >= start_index
 
+        class _Cancelled(Exception):
+            """用户取消：只在步骤边界中断，避免继续跑后续 npm/hexo 步骤。"""
+
+        def check_cancelled() -> None:
+            if task.stop_requested:
+                raise _Cancelled
+
+        def run_step(args: list[str], display: str) -> int:
+            """执行一条外部命令；命令前后都检查取消，取消后不再启动新命令。"""
+            check_cancelled()
+            code = run_task_command(task, args, target, display)
+            check_cancelled()
+            return code
+
+        def step_started(step_id: str, title: str) -> None:
+            """每个步骤开始前检查取消 —— 纯 Python 步骤（复制/写配置/欢迎文章）
+            原本完全不检查，用户点了取消仍会继续跑完后续 npm/hexo 并报 success。"""
+            check_cancelled()
+            nonlocal current_step
+            current_step = step_id
+            task.emit_step(step_id, "running")
+
+        def step_finished(step_id: str, detail: str = "") -> None:
+            check_cancelled()
+            task.emit_step(step_id, "success", detail)
+
         if step_enabled("environment"):
-            current_step = "environment"
-            task.emit_step(current_step, "running")
+            step_started("environment", "检查 Node.js / Git / npm 环境")
             task.emit("检查 Node.js、npm 和 Git 环境...", "system")
             checks = {name: tool_version(name) for name in ("node", "npm", "git")}
             missing = [name for name, info in checks.items() if not info[0]]
@@ -4243,81 +4361,74 @@ def run_autodeploy(task: Task, options: dict[str, Any]) -> None:
                 raise AutodeployError(
                     f"缺少必要工具：{'、'.join(missing)}。请安装 Node.js（https://nodejs.org/zh-cn/download）和 Git（https://git-scm.com/download/win），并加入 PATH。"
                 )
-            task.emit_step(current_step, "success")
+            step_finished("environment")
 
         if step_enabled("init"):
-            current_step = "init"
-            task.emit_step(current_step, "running")
+            step_started("init", "初始化 Hexo 项目")
             if options["mode"] == "create":
-                code = run_task_command(task, command_executable("npx", ["--yes", "hexo-cli", "init", "."]), target)
+                code = run_step(command_executable("npx", ["--yes", "hexo-cli", "init", "."]), "hexo-cli init")
                 if code != 0:
                     raise AutodeployError("hexo init 失败，请检查网络和 npm registry 配置。")
-                task.emit_step(current_step, "success")
+                step_finished("init")
             else:
                 task.emit("检测到已有 Hexo 项目，跳过初始化。", "warning")
-                task.emit_step(current_step, "success", "已有 Hexo 项目，跳过初始化")
+                step_finished("init", "已有 Hexo 项目，跳过初始化")
 
         if step_enabled("theme"):
-            current_step = "theme"
-            task.emit_step(current_step, "running")
+            step_started("theme", "克隆 Butterfly 主题")
             theme_dir = target / "themes" / "butterfly"
             theme_dir.parent.mkdir(parents=True, exist_ok=True)
             if options.get("skip_theme"):
                 task.emit("已选择跳过主题克隆，使用 Hexo 默认 landscape 主题。", "warning")
-                task.emit_step(current_step, "success", "已跳过，使用 landscape 主题")
+                step_finished("theme", "已跳过，使用 landscape 主题")
             elif theme_dir_is_usable(theme_dir):
                 task.emit("themes/butterfly 已存在且内容完整，跳过主题克隆。", "warning")
-                task.emit_step(current_step, "success", "主题目录已存在，已跳过")
+                step_finished("theme", "主题目录已存在，已跳过")
             else:
                 source = clone_theme_with_fallback(task, target, theme_dir, options)
-                task.emit_step(current_step, "success", f"已从 {source['label']} 克隆")
+                step_finished("theme", f"已从 {source['label']} 克隆")
 
         if not options.get("local_only") and options.get("auto_create_repo") and step_enabled("repo"):
-            current_step = "repo"
-            task.emit_step(current_step, "running")
+            step_started("repo", "创建或配置远程仓库")
             token = options.get("github_token", "")
             if token:
                 repo_result = ensure_github_repository(options["repo_url"], token, options["repo_private"])
                 if repo_result.get("created"):
                     task.emit(f"远程仓库已创建：{repo_result['owner']}/{repo_result['repo']}", "success")
-                    task.emit_step(current_step, "success", "远程仓库已创建")
+                    step_finished("repo", "远程仓库已创建")
                 else:
                     task.emit("远程仓库已存在，直接使用。", "success")
-                    task.emit_step(current_step, "success", "仓库已存在，直接使用")
+                    step_finished("repo", "仓库已存在，直接使用")
             elif options["repo_url"]:
                 task.emit("未提供 GitHub Token，跳过自动创建并使用已有仓库地址。", "warning")
-                task.emit_step(current_step, "success", "未提供 Token，跳过创建")
+                step_finished("repo", "未提供 Token，跳过创建")
             else:
                 raise AutodeployError("未提供 GitHub Token 且没有仓库地址。")
 
         if step_enabled("config"):
-            current_step = "config"
-            task.emit_step(current_step, "running")
+            step_started("config", "应用站点配置")
             apply_autodeploy_config(target, options, task)
-            task.emit_step(current_step, "success")
+            step_finished("config")
 
         if step_enabled("latex"):
-            current_step = "latex"
-            task.emit_step(current_step, "running")
+            step_started("latex", "配置 LaTeX 渲染")
             if options.get("skip_theme"):
                 task.emit("使用 landscape 主题，跳过 Butterfly MathJax 配置。", "warning")
-                task.emit_step(current_step, "success", "已跳过 Butterfly 主题")
+                step_finished("latex", "已跳过 Butterfly 主题")
             else:
                 configure_latex_rendering(target, task)
-                task.emit_step(current_step, "success", "MathJax 配置已写入根目录 _config.butterfly.yml")
+                step_finished("latex", "MathJax 配置已写入根目录 _config.butterfly.yml")
 
         if step_enabled("deps"):
-            current_step = "deps"
-            task.emit_step(current_step, "running")
+            step_started("deps", "安装依赖")
             task.emit("安装项目依赖：npm install", "system")
-            code = run_task_command(task, command_executable("npm", ["install"]), target)
+            code = run_step(command_executable("npm", ["install"]), "npm install")
             if code != 0:
                 raise AutodeployError("npm install 失败，请检查网络、Node.js 版本或 package.json。")
             task.emit("安装 Butterfly 渲染器：npm install hexo-renderer-pug hexo-renderer-stylus --save", "system")
-            code = run_task_command(
-                task,
+            code = run_step(
                 command_executable("npm", ["install", *THEME_RENDERER_DEPENDENCIES, "--save"]),
-                target,
+                "npm install 渲染器",
             )
             if code != 0:
                 expected_theme = "landscape" if options.get("skip_theme") else "butterfly"
@@ -4329,11 +4440,10 @@ def run_autodeploy(task: Task, options: dict[str, Any]) -> None:
                 task.emit("已安装渲染器：hexo-renderer-pug, hexo-renderer-stylus", "success")
             if not options.get("skip_theme"):
                 remove_conflicting_mathjax_plugin(target, task)
-            task.emit_step(current_step, "success", "项目依赖和 Butterfly 渲染器已安装")
+            step_finished("deps", "项目依赖和 Butterfly 渲染器已安装")
 
         if step_enabled("deps-check"):
-            current_step = "deps-check"
-            task.emit_step(current_step, "running")
+            step_started("deps-check", "检查主题渲染依赖")
             expected_theme = "landscape" if options.get("skip_theme") else "butterfly"
             status = inspect_theme_dependencies(target, expected_theme=expected_theme, check_public=False)
             emit_dependency_status(task, status)
@@ -4342,39 +4452,38 @@ def run_autodeploy(task: Task, options: dict[str, Any]) -> None:
                     "依赖不完整，缺少 hexo-renderer-pug 或 hexo-renderer-stylus，或主题未正确设置。"
                     "请点击“修复依赖”重新安装。"
                 )
-            task.emit_step(current_step, "success", "渲染器依赖和主题配置检查通过")
+            step_finished("deps-check", "渲染器依赖和主题配置检查通过")
 
         if options.get("copy_content") and step_enabled("copy"):
-            current_step = "copy"
-            task.emit_step(current_step, "running")
+            step_started("copy", "复制当前博客文章和图片")
             copy_current_content(target, task)
-            task.emit_step(current_step, "success", "已复制现有内容")
+            step_finished("copy", "已复制现有内容")
 
         if step_enabled("welcome"):
-            current_step = "welcome"
-            task.emit_step(current_step, "running")
+            step_started("welcome", "添加欢迎文章")
             if options.get("copy_content"):
                 task.emit("已选择复制现有文章和图片，跳过欢迎文章。", "warning")
-                task.emit_step(current_step, "success", "已复制现有内容，跳过")
+                step_finished("welcome", "已复制现有内容，跳过")
             else:
                 created = create_welcome_post(target, task)
-                task.emit_step(current_step, "success", "已创建 welcome.md" if created else "welcome.md 已存在，跳过")
+                step_finished("welcome", "已创建 welcome.md" if created else "welcome.md 已存在，跳过")
 
         if step_enabled("generate"):
-            current_step = "generate"
-            task.emit_step(current_step, "running")
+            step_started("generate", "生成静态文件")
             task.emit("先清理旧静态文件：hexo clean", "system")
-            code = run_task_command(task, command_executable("npx", ["--yes", "hexo", "clean"]), target)
+            code = run_step(command_executable("npx", ["--yes", "hexo", "clean"]), "hexo clean")
             if code != 0:
                 raise AutodeployError("hexo clean 失败，请查看上方日志中的插件或配置错误。")
-            code = run_task_command(task, command_executable("npx", ["--yes", "hexo", "generate"]), target)
+            code = run_step(command_executable("npx", ["--yes", "hexo", "generate"]), "hexo generate")
             if code != 0:
                 raise AutodeployError("hexo generate 失败，请查看上方日志中的插件或配置错误。")
             output = emit_generated_output_status(task, target)
             if output["pug_count"]:
                 raise AutodeployError("检测到 Pug 模板未被渲染，可能缺少 hexo-renderer-pug。请检查依赖安装。")
-            task.emit_step(current_step, "success", f"已生成 {output['html_count']} 个 HTML 文件")
+            step_finished("generate", f"已生成 {output['html_count']} 个 HTML 文件")
 
+        # 写标记文件/切换博客目录前最后确认一次，避免用户取消后仍然改配置
+        check_cancelled()
         marker = target / ".blogmanager-local-only"
         if options.get("local_only"):
             marker.write_text("local-only", encoding="utf-8")
@@ -4449,7 +4558,15 @@ def api_autodeploy() -> Response:
     settings_store.update_github(github_updates)
     if options["auto_create_repo"] and options["github_token"] and not options["local_only"]:
         ensure_github_repository(options["repo_url"], options["github_token"], options["repo_private"])
-    task = task_manager.create("autodeploy", "自动部署 Hexo + Butterfly", options["target"])
+    task, created = task_manager.create_if_idle(
+        "autodeploy", "自动部署 Hexo + Butterfly", options["target"]
+    )
+    if not created:
+        raise ApiError(
+            "已有自动部署任务正在运行，请等待它结束或先取消它。",
+            409,
+            {"task": task.snapshot()},
+        )
     task.local_only = bool(options.get("local_only"))
     task.options = copy.deepcopy(options)
     task.set_steps(autodeploy_step_definitions(options))
@@ -4495,12 +4612,114 @@ def port_owner_pids(port: int) -> list[int]:
     return sorted(pids)
 
 
-def terminate_port_processes(port: int) -> list[int]:
-    failed: list[int] = []
+PORT_CLEANUP_EXPECTED_IMAGES = {"node.exe", "npm.exe", "npx.exe", "python.exe", "pythonw.exe"}
+PORT_CLEANUP_KILL_GRACE_SECONDS = 2.0
+
+
+def process_image_name(pid: int) -> str:
+    """返回进程可执行文件名（小写）。无法确认时返回空串，调用方必须按"不可确认"处理。"""
+    if not pid or os.name != "nt":
+        return ""
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=NO_WINDOW,
+            check=False,
+        )
+    except OSError:
+        return ""
+    for row in csv.reader(io.StringIO(result.stdout)):
+        if len(row) >= 2 and row[1].strip().isdigit() and int(row[1]) == int(pid):
+            return row[0].strip().lower()
+    return ""
+
+
+def terminate_port_processes(port: int, task: Task | None = None) -> tuple[list[int], list[int]]:
+    """停止占用 port 的进程，返回 (killed, skipped)。
+
+    只杀"看起来确实是我们启动的"进程：要么 PID 是任务自己 Popen 的子进程，
+    要么进程名属于 node/npm/npx/python，且启动时间不早于任务开始时间。
+    如果无法确认身份，就跳过并让调用方提示用户手动处理 —— 宁可端口占着，
+    也不能因为 PID 复用或端口被别的程序接管而误杀无关进程树。
+    """
+    if not port:
+        return [], []
+    known_pids: set[int] = set()
+    if task is not None:
+        process = task.process
+        if process is not None:
+            known_pids.add(int(process.pid))
+        if task.pid:
+            known_pids.add(int(task.pid))
+    started_after = 0.0
+    if task is not None and task.started_at:
+        try:
+            started_after = datetime.fromisoformat(task.started_at).timestamp() - PORT_CLEANUP_KILL_GRACE_SECONDS
+        except (TypeError, ValueError):
+            started_after = 0.0
+
+    killed: list[int] = []
+    skipped: list[int] = []
     for pid in port_owner_pids(port):
-        if not terminate_pid_tree(pid):
-            failed.append(pid)
-    return failed
+        if pid in known_pids:
+            if terminate_pid_tree(pid):
+                killed.append(pid)
+            else:
+                skipped.append(pid)
+            continue
+        image = process_image_name(pid)
+        if image not in PORT_CLEANUP_EXPECTED_IMAGES:
+            LOGGER.warning(
+                "port cleanup skipped | port=%s | pid=%s | image=%s | reason=unexpected-process",
+                port, pid, image or "unknown",
+            )
+            skipped.append(pid)
+            continue
+        if started_after:
+            created = pid_creation_time(pid)
+            if created and created < started_after:
+                LOGGER.warning(
+                    "port cleanup skipped | port=%s | pid=%s | image=%s | reason=started-before-task",
+                    port, pid, image,
+                )
+                skipped.append(pid)
+                continue
+        LOGGER.info("port cleanup kill | port=%s | pid=%s | image=%s", port, pid, image)
+        if terminate_pid_tree(pid):
+            killed.append(pid)
+        else:
+            skipped.append(pid)
+    return killed, skipped
+
+
+def pid_creation_time(pid: int) -> float:
+    """进程启动时间（epoch 秒）。无法确认时返回 0.0。"""
+    if not pid or os.name != "nt":
+        return 0.0
+    script = (
+        f"$p=Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue;"
+        "if($p){[int][double]::Parse((Get-Date $p.StartTime -UFormat %s))}"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=NO_WINDOW,
+            check=False,
+        )
+    except OSError:
+        return 0.0
+    try:
+        return float(result.stdout.strip())
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def terminate_pid_tree(pid: int) -> bool:
@@ -4567,7 +4786,7 @@ def cleanup_runtime() -> dict[str, Any]:
 @app.post("/api/client/ping")
 def api_client_ping() -> Response:
     with CLIENT_LOCK:
-        CLIENT_STATE["last_seen"] = time.time()
+        CLIENT_STATE["last_seen"] = time.monotonic()
         CLIENT_STATE["active"] = True
         CLIENT_STATE["goodbye_at"] = 0.0
         CLIENT_STATE["generation"] = int(CLIENT_STATE.get("generation", 0)) + 1
@@ -4648,7 +4867,9 @@ def api_clone_blog() -> Response:
     if missing:
         raise ApiError(f"缺少必要工具：{'、'.join(missing)}。", 412, {"missing": missing, "preflight": preflight})
     target.parent.mkdir(parents=True, exist_ok=True)
-    task = task_manager.create("clone", f"git clone {repo_url}", target)
+    task, created = task_manager.create_if_idle("clone", f"git clone {repo_url}", target)
+    if not created:
+        raise ApiError("已有克隆任务正在运行，请等待它结束。", 409, {"task": task.snapshot()})
     threading.Thread(target=run_clone_blog, args=(task, target, repo_url, branch), daemon=True).start()
     return jsonify({"task": task.snapshot()}), 202
 
@@ -4675,7 +4896,11 @@ def api_retry_autodeploy(task_id: str) -> Response:
         saved_autodeploy = dict(saved_autodeploy)
         saved_autodeploy["theme_repo"] = options["theme_repo"]
         settings_store.set_section("autodeploy", saved_autodeploy)
-    task = task_manager.create("autodeploy", "自动部署 Hexo + Butterfly（重试）", options["target"])
+    task, created = task_manager.create_if_idle(
+        "autodeploy", "自动部署 Hexo + Butterfly（重试）", options["target"]
+    )
+    if not created:
+        raise ApiError("已有自动部署任务正在运行，请等待它结束或先取消它。", 409, {"task": task.snapshot()})
     task.local_only = bool(options.get("local_only"))
     task.options = copy.deepcopy(options)
     task.set_steps(autodeploy_step_definitions(options))
@@ -4691,7 +4916,11 @@ def api_repair_autodeploy_dependencies(task_id: str) -> Response:
         raise ApiError("找不到该自动部署任务的可修复参数。", 404)
     options = copy.deepcopy(dict(previous_options))
     options["resume_from"] = "deps"
-    task = task_manager.create("autodeploy", "自动部署 Hexo + Butterfly（修复依赖）", options["target"])
+    task, created = task_manager.create_if_idle(
+        "autodeploy", "自动部署 Hexo + Butterfly（修复依赖）", options["target"]
+    )
+    if not created:
+        raise ApiError("已有自动部署任务正在运行，请等待它结束或先取消它。", 409, {"task": task.snapshot()})
     task.local_only = bool(options.get("local_only"))
     task.options = copy.deepcopy(options)
     task.set_steps(autodeploy_step_definitions(options))
@@ -4986,17 +5215,48 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def client_is_abandoned(started_at: float, now: float | None = None) -> tuple[bool, float]:
+    """判断浏览器是否已离开，返回 (是否退出, 空闲秒数)。
+
+    必须同时满足：收到过心跳、空闲超过 CLIENT_IDLE_TIMEOUT、且已过启动宽限期。
+    时间基准统一用 time.monotonic()，避免墙钟被校正或休眠唤醒抛跳。
+    """
+    now = time.monotonic() if now is None else now
+    with CLIENT_LOCK:
+        active = bool(CLIENT_STATE["active"])
+        last_seen = float(CLIENT_STATE["last_seen"])
+    idle = now - last_seen
+    if not active:
+        return False, idle
+    if now - started_at < CLIENT_WATCHDOG_STARTUP_GRACE:
+        return False, idle
+    return idle > CLIENT_IDLE_TIMEOUT, idle
+
+
 def start_client_watchdog() -> None:
-    time.sleep(35)
+    """浏览器窗口关闭后自动退出，但绝不能误杀正在工作的用户。
+
+    判定条件必须同时满足，任一不满足都继续等待：
+    1. 曾收到过心跳（active）；
+    2. 距上次心跳超过 CLIENT_IDLE_TIMEOUT —— 90 秒容忍窗口，足以覆盖
+       后台标签被浏览器节流（Chrome 隐藏 5 分钟后约 1 次/分钟）、
+       系统休眠唤醒、以及长时间的 npm/hexo 命令；
+    3. 已过启动宽限期，避免首屏尚未就绪就被判定为失联。
+
+    时间差一律用 time.monotonic()，墙钟（time.time）会被 NTP 校正或
+    休眠唤醒抛跳，曾导致应用在自动部署途中自行退出。
+    """
+    started = time.monotonic()
     while True:
-        with CLIENT_LOCK:
-            active = bool(CLIENT_STATE["active"])
-            last_seen = float(CLIENT_STATE["last_seen"])
-        if active and time.time() - last_seen > 30:
+        time.sleep(CLIENT_WATCHDOG_INTERVAL)
+        abandoned, idle = client_is_abandoned(started)
+        if abandoned:
+            LOGGER.warning(
+                "client watchdog exit | idle=%.1fs | timeout=%.1fs", idle, CLIENT_IDLE_TIMEOUT
+            )
             cleanup_runtime()
             time.sleep(0.3)
             os._exit(0)
-        time.sleep(4)
 
 
 def main() -> int:
@@ -5006,6 +5266,13 @@ def main() -> int:
     port = find_free_port(args.port)
     url = f"http://127.0.0.1:{port}"
     LOGGER.info("Blog Manager starting | port=%s | browser=%s", port, not args.no_browser)
+    # 上次异常退出（os._exit / 强制结束）可能遗留临时文件，启动时清理一次
+    try:
+        blog = blog_directory()
+        if blog is not None and blog.is_dir():
+            cleanup_stale_temp_files(blog)
+    except (OSError, ApiError) as exc:
+        LOGGER.warning("startup temp cleanup skipped | %s", exc)
     if not args.no_browser:
         threading.Thread(target=open_app_window_when_ready, args=(url,), daemon=True).start()
         threading.Thread(target=start_client_watchdog, daemon=True).start()
