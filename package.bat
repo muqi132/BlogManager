@@ -49,15 +49,11 @@ if not exist "%TEMP_PACKAGE%" (
 )
 
 echo [2/4] 复制项目文件...
-robocopy "%ROOT%" "%TEMP_PACKAGE%" /E /XD ".venv" "__pycache__" ".git" "dist" "node_modules" ".e2e-yaml-probe" ".userdata" ".deps" ".testblog" ".blogmanager-trash" /XF "*.pyc" "*.log" "config.json" "settings.json" "*.blogmanager.bak" "*.blogmanager.tmp" "*.bak" "*.tmp" "push.bat" "package-lock.json" >nul
-set "ROBOCOPY_CODE=%ERRORLEVEL%"
-
-if %ROBOCOPY_CODE% GEQ 8 (
-  echo [错误] 复制项目文件失败，robocopy 返回代码：%ROBOCOPY_CODE%
-  if exist "%TEMP_PACKAGE%" rmdir /s /q "%TEMP_PACKAGE%" >nul 2>&1
-  echo.
-  pause
-  exit /b 1
+robocopy "%ROOT%" "%TEMP_PACKAGE%" app.py README.md requirements.txt start.bat package.bat /XJ >nul
+if errorlevel 8 goto copy_failed
+for %%D in (static templates) do (
+  robocopy "%ROOT%\%%D" "%TEMP_PACKAGE%\%%D" *.html *.css *.js *.svg *.png *.jpg *.jpeg *.gif *.webp *.ico *.woff *.woff2 *.ttf LICENSE /E /XJ /XF "*.log" "*.bak" "*.tmp" >nul
+  if errorlevel 8 goto copy_failed
 )
 
 echo [3/4] 生成日期和压缩包...
@@ -74,7 +70,7 @@ if not defined DATE_TAG (
 
 set "ZIP_FILE=%DIST%\BlogManager_%DATE_TAG%.zip"
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%TEMP_PACKAGE%\*' -DestinationPath '%ZIP_FILE%' -Force"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path (Join-Path $env:TEMP_PACKAGE '*') -DestinationPath $env:ZIP_FILE -Force"
 if errorlevel 1 (
   echo [错误] 压缩文件失败。
   echo 目标文件：%ZIP_FILE%
@@ -94,7 +90,7 @@ if not exist "%ZIP_FILE%" (
   exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; $z=[IO.Compression.ZipFile]::OpenRead('%ZIP_FILE%'); $sep=[string][char]92; $bad=@($z.Entries | ForEach-Object { $_.FullName.Replace($sep,'/') } | Where-Object { $_ -match '(?i)(^|/)(\.venv|\.git|\.userdata|\.deps|\.testblog|\.blogmanager-trash|__pycache__|dist|logs|node_modules|\.e2e[^/]*)(/|$)|(^|/)(config\.json|settings\.json|push\.bat|package-lock\.json)$|\.(pyc|log|bak|tmp)$' } | Sort-Object -Unique); $z.Dispose(); if($bad.Count -gt 0){ Write-Host ('[错误] 压缩包包含敏感文件：' + ($bad -join ', ')); exit 1 }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; $z=[IO.Compression.ZipFile]::OpenRead($env:ZIP_FILE); $sep=[string][char]92; $bad=@($z.Entries | ForEach-Object { $_.FullName.Replace($sep,'/') } | Where-Object { $_ -match '(?i)(^|/)(\.venv|\.git|\.userdata|\.deps|\.testblog|\.blogmanager-trash|__pycache__|dist|logs|node_modules|\.e2e[^/]*)(/|$)|(^|/)(config\.json|settings\.json|push\.bat|package-lock\.json)$|\.(pyc|log|bak|tmp)$' } | Sort-Object -Unique); $z.Dispose(); if($bad.Count -gt 0){ Write-Host ('[错误] 压缩包包含敏感文件：' + ($bad -join ', ')); exit 1 }"
 if errorlevel 1 (
   echo [错误] 打包后检测到敏感文件，已删除压缩包。
   if exist "%ZIP_FILE%" del /f /q "%ZIP_FILE%" >nul 2>&1
@@ -120,7 +116,12 @@ echo.
 echo 生成的压缩包：
 echo %ZIP_FILE%
 echo.
-echo 已排除：.venv、__pycache__、.git、dist、node_modules、.e2e-yaml-probe、.userdata、.deps、.testblog、.blogmanager-trash、push.bat、package-lock.json、config.json、settings.json、*.blogmanager.bak、*.blogmanager.tmp、*.bak、*.tmp、*.pyc、*.log
+echo 按白名单打包 app.py、README.md、requirements.txt、start.bat、package.bat、static、templates。额外排除：.venv、__pycache__、.git、dist、node_modules、.e2e-yaml-probe、.userdata、.deps、.testblog、.blogmanager-trash、push.bat、package-lock.json、config.json、settings.json、*.blogmanager.bak、*.blogmanager.tmp、*.bak、*.tmp、*.pyc、*.log
 echo.
 pause
 exit /b 0
+
+:copy_failed
+ echo [错误] 复制项目文件失败，未生成压缩包。
+ pause
+ exit /b 1

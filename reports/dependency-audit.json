@@ -1,0 +1,68 @@
+{
+  "date": "2026-10-09",
+  "source": "https://api.osv.dev/v1/querybatch",
+  "packages": [
+    {
+      "name": "Flask",
+      "version": "3.1.3",
+      "advisories": []
+    },
+    {
+      "name": "Werkzeug",
+      "version": "3.1.9",
+      "advisories": []
+    },
+    {
+      "name": "Jinja2",
+      "version": "3.1.6",
+      "advisories": []
+    },
+    {
+      "name": "MarkupSafe",
+      "version": "3.0.3",
+      "advisories": []
+    },
+    {
+      "name": "itsdangerous",
+      "version": "2.2.0",
+      "advisories": []
+    },
+    {
+      "name": "click",
+      "version": "8.5.0",
+      "advisories": []
+    },
+    {
+      "name": "blinker",
+      "version": "1.9.0",
+      "advisories": []
+    },
+    {
+      "name": "ruamel.yaml",
+      "version": "0.18.17",
+      "advisories": []
+    },
+    {
+      "name": "ruamel.yaml.clib",
+      "version": "0.2.15",
+      "advisories": []
+    },
+    {
+      "name": "markdown-it",
+      "version": "14.3.1",
+      "advisories": []
+    },
+    {
+      "name": "katex",
+      "version": "0.16.22",
+      "advisories": [
+        "GHSA-238p-pmpm-9mq7"
+      ]
+    },
+    {
+      "name": "highlight.js",
+      "version": "11.11.1",
+      "advisories": []
+    }
+  ]
+}

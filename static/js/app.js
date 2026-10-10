@@ -1737,6 +1737,7 @@ function bindImageDropZone({ zone, overlay, progress, extensions, onFiles, noun 
   zone.addEventListener("drop", async (event) => {
     if (!event.dataTransfer) return;
     event.preventDefault();
+    event.stopPropagation();
     reset();
     const dropped = Array.from(event.dataTransfer.files || []);
     if (!dropped.length) return;
@@ -1854,8 +1855,10 @@ function toDateInputValue(value) {
   const text = String(value || "").trim();
   if (!text) return "";
   const normalized = text.replace(/\//g, "-").replace(" ", "T").replace(/Z$/i, "");
-  const match = normalized.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
-  return match ? `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}` : text;
+  const match = normalized.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:T(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+  if (!match) return text;
+  const day = `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}`;
+  return match[4] ? `${day}T${match[4].padStart(2, "0")}:${match[5]}:${match[6] || "00"}` : day;
 }
 
 function frontmatterDisplayValue(property) {
@@ -1893,7 +1896,8 @@ function createFrontmatterValueControl(property) {
     control.step = "any";
   } else if (type === "date") {
     control = document.createElement("input");
-    control.type = "date";
+    control.type = /T\d/.test(toDateInputValue(property.value)) ? "datetime-local" : "date";
+    control.step = "1";
   } else {
     control = document.createElement("input");
     control.type = "text";
@@ -1971,12 +1975,12 @@ function collectFrontmatterProperties() {
       const control = $('[data-field="value"]', row);
       const selectedDate = raw.trim().replace("T", " ");
       const originalValue = String(control.dataset.originalValue || "").trim().replace("T", " ");
-      const originalDate = String(control.dataset.originalDateValue || "").trim();
+      const originalDate = String(control.dataset.originalDateValue || "").trim().replace("T", " ");
       if (selectedDate && originalDate && selectedDate === originalDate && originalValue) {
         value = originalValue;
       } else {
         const time = originalValue.match(/[ T](\d{1,2}:\d{2}(?::\d{2})?)/);
-        value = selectedDate && time ? `${selectedDate} ${time[1]}` : selectedDate;
+        value = selectedDate && time && !/[ T]\d{1,2}:/.test(selectedDate) ? `${selectedDate} ${time[1]}` : selectedDate;
       }
     } else {
       value = raw;
@@ -2352,7 +2356,7 @@ function loadMathJax() {
     const script = document.createElement("script");
     script.src = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js";
     script.onload = () => resolve(window.MathJax.typesetPromise());
-    script.onerror = () => reject(new Error("MathJax 加载失败"));
+    script.onerror = () => { mathJaxPromise = null; script.remove(); reject(new Error("MathJax 加载失败")); };
     document.head.append(script);
   });
   return mathJaxPromise;
@@ -2379,23 +2383,27 @@ function renderMarkdownPreview() {
   }
   const preview = $("#markdownPreview");
   const source = stripFrontMatter($("#markdownSource").value);
+  if (source.length > 200000) {
+    preview.textContent = source;
+    $("#markdownPreviewMeta").textContent = "文档较大，显示文本预览以保持编辑流畅";
+    return;
+  }
   const codeProtected = protectCodeRegions(source);
   const protectedSource = protectMath(codeProtected.text);
   state.editor.codeTokens = codeProtected.codeTokens;
   let html;
   try {
     html = markdownRenderer
-      ? markdownRenderer.render(protectedSource.text)
-      : basicMarkdown(protectedSource.text);
+      ? markdownRenderer.render(restoreCodeTokens(protectedSource.text, codeProtected.codeTokens))
+      : basicMarkdown(restoreCodeTokens(protectedSource.text, codeProtected.codeTokens));
   } catch (_error) {
-    html = basicMarkdown(protectedSource.text);
+    html = basicMarkdown(restoreCodeTokens(protectedSource.text, codeProtected.codeTokens));
   }
   html = html.replace(/BM_MATH_(\d+)_TOKEN/g, (match, rawIndex) => {
     const index = Number(rawIndex);
     const math = protectedSource.maths[index];
     return math ? `<span class="math-render" data-math-index="${index}" data-display="${math.display ? "1" : "0"}"></span>` : match;
   });
-  html = restoreCodeTokens(html, codeProtected.codeTokens);
   if (window.DOMPurify) html = window.DOMPurify.sanitize(html, { ADD_ATTR: ["data-math-index", "data-display"] });
   preview.innerHTML = html;
   const nodes = Array.from(preview.querySelectorAll(".math-render"));
@@ -2565,17 +2573,21 @@ async function handleImageDrop(files) {
 }
 
 async function handleCoverDrop(files) {
+  const selectedValue = state.cover.selectedValue;
+  const relativePath = state.cover.relativePath;
   const data = await uploadImageFiles(files, "cover");
   const images = data.images || [];
-  if (images.length) {
-    // 最后一张作为当前选中，其余也加入“新加入”分组
-    images.forEach((image, index) => {
-      if (index === images.length - 1) addNewCoverImage(image);
-      else {
-        state.images = [image, ...state.images.filter((item) => item.relative_path !== image.relative_path)];
-        state.cover.newImages.add(image.relative_path);
-      }
-    });
+  images.forEach((image) => {
+    state.images = [image, ...state.images.filter((item) => item.relative_path !== image.relative_path)];
+    if (state.cover.relativePath === relativePath) state.cover.newImages.add(image.relative_path);
+  });
+  // Uploading is independent of selecting: preserve the choice made before or
+  // during the upload, and do not mutate a different article's dialog.
+  if (state.cover.relativePath === relativePath && $("#coverDialog").open) {
+    if (!selectedValue && !state.cover.selectedValue && images.length) {
+      state.cover.selectedValue = coverValueForImage(images[images.length - 1]);
+      setCoverPreview(state.cover.selectedValue);
+    }
     renderCoverLibrary();
   }
   return data;

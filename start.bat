@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
+setlocal EnableExtensions DisableDelayedExpansion
 chcp 65001 >nul
 cd /d "%~dp0"
 
@@ -40,7 +40,7 @@ if not exist "%VENV_PY%" if not defined BASE_PY (
 
 if not exist "%VENV_PY%" (
   echo [1/3] 正在创建独立 Python 环境...
-  if /I "!BASE_PY!"=="py" (
+  if /I "%BASE_PY%"=="py" (
     py -3 -m venv ".venv"
   ) else (
     python -m venv ".venv"
@@ -66,17 +66,17 @@ if not exist "%RUN_PY%" (
 
 echo [2/3] 正在检查并更新运行依赖...
 set "PIP_OK="
-"%RUN_PY%" -m pip install --disable-pip-version-check --upgrade -r requirements.txt -i "%PYPI%" >nul 2>&1
+"%RUN_PY%" -m pip install --disable-pip-version-check -r requirements.txt -i "%PYPI%" >nul 2>&1
 if not errorlevel 1 set "PIP_OK=1"
 
 if not defined PIP_OK (
   echo [Blog Manager] 国内镜像暂不可用，正在回退到官方 PyPI...
-  "%RUN_PY%" -m pip install --disable-pip-version-check --upgrade -r requirements.txt >nul 2>&1
+  "%RUN_PY%" -m pip install --disable-pip-version-check -r requirements.txt >nul 2>&1
   if not errorlevel 1 set "PIP_OK=1"
 )
 
 if not defined PIP_OK (
-  "%RUN_PY%" -c "import flask, ruamel.yaml" >nul 2>&1
+  "%RUN_PY%" -c "import flask, ruamel.yaml; from importlib.metadata import version; assert tuple(map(int, version('Werkzeug').split('.'))) >= (3,1,9); assert tuple(map(int, version('Jinja2').split('.'))) >= (3,1,6)" >nul 2>&1
   if not errorlevel 1 set "PIP_OK=1"
 )
 

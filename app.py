@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from ruamel.yaml import YAML
@@ -72,8 +72,10 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".
 COVER_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 MAX_IMAGE_UPLOAD_MB = 20
 MAX_TASK_LINES = 5000
+MAX_TEXT_FILE_BYTES = 8 * 1024 * 1024
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 BROWSER_PIDS: list[int] = []
+BROWSER_PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 BROWSER_LOCK = threading.RLock()
 CLIENT_STATE = {"last_seen": time.monotonic(), "active": False, "goodbye_at": 0.0, "generation": 0}
 # 客户端心跳判定。用 time.monotonic 而不是 time.time，避免墙钟被 NTP 校正或
@@ -214,7 +216,10 @@ class SettingsStore:
         self.settings["config_version"] = 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = self.path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(self.settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        persisted = copy.deepcopy(self.settings)
+        if not persisted["github"].get("remember"):
+            persisted["github"]["token"] = ""
+        temp_path.write_text(json.dumps(persisted, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(temp_path, self.path)
 
     def set_blog_dir(self, blog_dir: str) -> Path:
@@ -271,7 +276,6 @@ class SettingsStore:
             shutil.rmtree(BROWSER_PROFILE_DIR, ignore_errors=True)
 
 
-settings_store = SettingsStore(CONFIG_FILE, LEGACY_SETTINGS_FILE)
 app = Flask(__name__)
 app.json.ensure_ascii = False
 # 限制单个请求体大小，避免超大的 raw_yaml / 表单把内存或磁盘吃满。
@@ -298,7 +302,25 @@ def configure_application_logging() -> logging.Logger:
     return logger
 
 
+def redact_sensitive(text: Any) -> str:
+    value = str(text)
+    value = re.sub(r"(?i)(https?://)[^/\s@]+@", r"\1[REDACTED]@", value)
+    value = re.sub(r"(?i)((?:token|password|passwd|secret|authorization|access_token)[\"']?\s*[:=]\s*[\"']?)(?:bearer\s+)?[^\s\"'&,}]+", r"\1[REDACTED]", value)
+    value = re.sub(r"(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)", "[REDACTED]", value)
+    return value
+
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_sensitive(super().format(record))
+
+
 LOGGER = configure_application_logging()
+for _handler in LOGGER.handlers:
+    _handler.setFormatter(RedactingFormatter("%(asctime)s | %(levelname)s | %(message)s"))
+settings_store = SettingsStore(CONFIG_FILE, LEGACY_SETTINGS_FILE)
+MUTATION_LOCK = threading.RLock()
+IMAGE_WRITE_LOCK = threading.RLock()
 
 def blog_directory() -> Path | None:
     value = str(settings_store.get().get("blog_dir", "") or "").strip()
@@ -315,7 +337,7 @@ def require_blog_directory() -> Path:
 
 
 def site_config_path() -> Path:
-    return require_blog_directory() / SITE_CONFIG_NAME
+    return ensure_child_path(require_blog_directory(), SITE_CONFIG_NAME)
 
 
 def theme_name() -> str:
@@ -333,9 +355,58 @@ def theme_name() -> str:
 
 def theme_config_paths() -> tuple[Path, Path]:
     blog = require_blog_directory()
-    base = blog / "themes" / theme_name() / "_config.yml"
-    override = blog / THEME_CONFIG_NAME
+    base = ensure_child_path(blog, "themes/" + theme_name() + "/_config.yml")
+    override = ensure_child_path(blog, THEME_CONFIG_NAME)
     return base, override
+
+
+def validate_yaml_source(raw: str) -> None:
+    # Validate composed nodes before round-trip loading: ruamel's round-trip
+    # constructor may replace recursive aliases with None, hiding the cycle.
+    if len(raw.encode("utf-8")) > MAX_TEXT_FILE_BYTES:
+        raise ApiError("YAML 内容超过 8 MB，请使用外部编辑器处理。", 413)
+    node = YAML(typ="base").compose(raw)
+    active: set[int] = set()
+    count = 0
+    def visit(item: Any, depth: int = 0) -> None:
+        nonlocal count
+        count += 1
+        if count > 100000 or depth > 80:
+            raise ApiError("YAML 结构过大或嵌套过深。")
+        if item is None:
+            return
+        identity = id(item)
+        if identity in active:
+            raise ApiError("YAML 不支持循环引用。")
+        active.add(identity)
+        if isinstance(item.value, list):
+            for child in item.value:
+                if isinstance(child, tuple):
+                    visit(child[0], depth + 1)
+                    visit(child[1], depth + 1)
+                else:
+                    visit(child, depth + 1)
+        active.remove(identity)
+    visit(node)
+
+
+def validate_yaml_structure(document: Any) -> None:
+    active: set[int] = set()
+    nodes = 0
+    def visit(value: Any, depth: int = 0) -> None:
+        nonlocal nodes
+        nodes += 1
+        if nodes > 100000 or depth > 80:
+            raise ApiError("YAML 结构过大或嵌套过深。")
+        if isinstance(value, (Mapping, list, tuple)):
+            identity = id(value)
+            if identity in active:
+                raise ApiError("YAML 不支持循环引用。")
+            active.add(identity)
+            for item in (value.values() if isinstance(value, Mapping) else value):
+                visit(item, depth + 1)
+            active.remove(identity)
+    visit(document)
 
 
 def new_round_trip_yaml() -> YAML:
@@ -354,7 +425,7 @@ def plain_value(value: Any) -> Any:
         return [plain_value(item) for item in value]
     if isinstance(value, datetime):
         # 保持 "YYYY-MM-DD HH:mm:ss"，与前端 toDateInputValue / merge_date_time 一致
-        return value.strftime("%Y-%m-%d %H:%M:%S") if (value.hour or value.minute or value.second) else value.strftime("%Y-%m-%d")
+        return value.isoformat(sep=" ")
     if isinstance(value, date):
         # 未加引号的 `date: 2024-01-01` 会被 ruamel 解析成 datetime.date；
         # 若直接交给 jsonify，Flask 会用 http_date 渲染成 "Mon, 01 Jan 2024 00:00:00 GMT"，
@@ -373,8 +444,14 @@ def load_yaml_file(path: Path, allow_missing: bool = False) -> CommentedMap:
 
     yaml = new_round_trip_yaml()
     try:
+        if path.stat().st_size > MAX_TEXT_FILE_BYTES:
+            raise ApiError("配置文件超过 8 MB，请使用外部编辑器处理。", 413)
         with path.open("r", encoding="utf-8") as handle:
-            document = yaml.load(handle)
+            raw = handle.read()
+            validate_yaml_source(raw)
+            document = yaml.load(raw)
+    except ApiError:
+        raise
     except UnicodeDecodeError as exc:
         raise ApiError(f"{path.name} 不是有效的 UTF-8 文件。") from exc
     except Exception as exc:
@@ -384,19 +461,24 @@ def load_yaml_file(path: Path, allow_missing: bool = False) -> CommentedMap:
         document = CommentedMap()
     if not isinstance(document, Mapping):
         raise ApiError(f"{path.name} 的根节点必须是 YAML 映射。")
+    validate_yaml_structure(document)
     return document
 
 
 def load_yaml_text(raw: str, label: str) -> CommentedMap:
     yaml = new_round_trip_yaml()
     try:
+        validate_yaml_source(raw)
         document = yaml.load(raw)
+    except ApiError:
+        raise
     except Exception as exc:
         raise ApiError(f"{label} YAML 格式错误：{exc}") from exc
     if document is None:
         document = CommentedMap()
     if not isinstance(document, Mapping):
         raise ApiError(f"{label} 的根节点必须是 YAML 映射。")
+    validate_yaml_structure(document)
     return document
 
 
@@ -763,7 +845,7 @@ def dump_yaml_value(value: Any) -> str:
 
 def write_yaml_file(path: Path, document: Mapping[str, Any]) -> Path:
     backup_path = path.with_suffix(path.suffix + ".blogmanager.bak")
-    temp_path = path.with_suffix(path.suffix + ".blogmanager.tmp")
+    temp_path = path.with_name(path.name + "." + uuid.uuid4().hex + ".blogmanager.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and not backup_path.exists():
@@ -881,6 +963,8 @@ def build_social_mapping(items: Any) -> CommentedMap:
 def ensure_child_path(root: Path, relative: str) -> Path:
     if not relative:
         raise ApiError("文件路径不能为空。")
+    if ":" in relative or "\x00" in relative:
+        raise ApiError("文件路径包含不允许的字符。", 403)
     candidate = (root / relative).resolve()
     root_resolved = root.resolve()
     if candidate != root_resolved and root_resolved not in candidate.parents:
@@ -894,7 +978,9 @@ def list_files(root: Path, extensions: set[str]) -> list[Path]:
     files: list[Path] = []
     for path in root.rglob("*"):
         try:
-            if path.is_file() and path.suffix.lower() in extensions and TRASH_DIR_NAME not in path.parts:
+            if (path.is_file() and path.suffix.lower() in extensions
+                    and TRASH_DIR_NAME not in path.parts
+                    and path.resolve().is_relative_to(root.resolve())):
                 files.append(path)
         except OSError:
             continue
@@ -903,6 +989,8 @@ def list_files(root: Path, extensions: set[str]) -> list[Path]:
 
 def read_post_frontmatter(path: Path) -> dict[str, Any]:
     try:
+        if path.stat().st_size > MAX_TEXT_FILE_BYTES:
+            raise OSError("文章超过 8 MB，请使用外部编辑器处理。")
         text = path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError:
         return {
@@ -939,7 +1027,9 @@ def read_post_frontmatter(path: Path) -> dict[str, Any]:
         }
     try:
         yaml = new_round_trip_yaml()
+        validate_yaml_source(match.group(1))
         metadata = yaml.load(match.group(1))
+        validate_yaml_structure(metadata)
         if metadata is None:
             metadata = CommentedMap()
         if not isinstance(metadata, Mapping):
@@ -1010,9 +1100,11 @@ def coerce_frontmatter_value(
             raise ApiError(f"数字类型属性格式不正确：{value}") from exc
     if kind == "yaml":
         try:
+            validate_yaml_source(str(value or ""))
             parsed = YAML(typ="safe").load(str(value or ""))
         except Exception as exc:
             raise ApiError(f"YAML 属性解析失败：{exc}") from exc
+        validate_yaml_structure(parsed)
         return plain_value(parsed) if parsed is not None else ""
     if kind == "date":
         return merge_date_time(value, original_value)
@@ -1020,31 +1112,28 @@ def coerce_frontmatter_value(
 
 
 def merge_date_time(value: Any, original_value: Any) -> str:
-    """属性弹窗只显示和回传年月日。输入不含时间时保留原值的时分秒，避免静默丢时间。"""
-    matched = re.match(
-        r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?",
-        str(value or "").strip(),
+    """Keep seconds, fractions and timezone when editing a calendar date."""
+    pattern = re.compile(
+        r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})"
+        r"(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?)?$"
     )
+    text = str(value or "").strip()
+    matched = pattern.fullmatch(text)
     if not matched:
-        # 用户手动填写了无法识别的日期，保持原样交给上层处理。
-        return str(value or "").strip()
-    normalized_date = f"{matched.group(1)}-{int(matched.group(2)):02d}-{int(matched.group(3)):02d}"
-    if matched.group(4):
-        return (
-            f"{normalized_date} {int(matched.group(4)):02d}:{int(matched.group(5)):02d}:"
-            f"{int(matched.group(6) or 0):02d}"
-        )
-    # 输入只有日期：若原值带时间，沿用原时间，保持原有排序语义。
-    original = re.match(
-        r"^\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?",
-        str(original_value or "").strip(),
-    )
-    if original and str(original.group(1)) == matched.group(1):
-        return (
-            f"{normalized_date} {int(original.group(4)):02d}:{int(original.group(5)):02d}:"
-            f"{int(original.group(6) or 0):02d}"
-        )
-    return normalized_date
+        return text
+    original = pattern.fullmatch(str(original_value or "").strip())
+    day = f"{matched[1]}-{int(matched[2]):02d}-{int(matched[3]):02d}"
+    time_source = matched if matched[4] else original
+    result = day
+    if time_source and time_source[4]:
+        zone = time_source[8] or (original[8] if original else "") or ""
+        result += (f" {int(time_source[4]):02d}:{int(time_source[5]):02d}:"
+                   f"{int(time_source[6] or 0):02d}{time_source[7] or ''}{zone}")
+    try:
+        datetime.fromisoformat(result.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ApiError("日期或时间无效，请检查年月日、时分秒。") from exc
+    return result
 
 
 def frontmatter_metadata_from_properties(
@@ -1053,15 +1142,21 @@ def frontmatter_metadata_from_properties(
 ) -> CommentedMap:
     if not isinstance(properties, list):
         raise ApiError("frontmatter 必须是属性数组。")
-    metadata = CommentedMap()
+    metadata = copy.deepcopy(original_metadata) if isinstance(original_metadata, Mapping) else CommentedMap()
+    requested_names = {normalize_text(item.get("name"), "属性名") for item in properties if isinstance(item, Mapping)}
+    for old_name in list(metadata):
+        if old_name not in requested_names:
+            del metadata[old_name]
+    seen: set[str] = set()
     for item in properties:
         if not isinstance(item, Mapping):
             raise ApiError("front-matter 属性格式不正确。")
         name = normalize_text(item.get("name"), "属性名")
         if not name:
             continue
-        if name in metadata:
+        if name in seen:
             raise ApiError(f"属性名重复：{name}")
+        seen.add(name)
         value_type = normalize_text(item.get("type"), "属性类型") or "text"
         original_value = original_metadata.get(name) if isinstance(original_metadata, Mapping) else None
         metadata[name] = coerce_frontmatter_value(value_type, item.get("value"), original_value)
@@ -1089,12 +1184,12 @@ def repair_post_frontmatter(path: Path, root: Path) -> dict[str, Any]:
     relative = path.relative_to(root).as_posix()
     info = read_post_frontmatter(path)
     invalid_existing = bool(info["has_delimiters"] and not info["valid"])
-    if invalid_existing and not info.get("has_closing"):
+    if invalid_existing:
         return {
             "relative_path": relative,
             "changed": False,
             "changes": [],
-            "error": info["error"] or "front-matter 缺少结束分隔符，需手动修复。",
+            "error": info["error"] or "front-matter 格式错误，需手动修复以保留原属性。",
         }
     if info.get("error") and not info.get("text"):
         return {"relative_path": relative, "changed": False, "changes": [], "error": str(info["error"])}
@@ -1121,7 +1216,7 @@ def repair_post_frontmatter(path: Path, root: Path) -> dict[str, Any]:
     if body and not body.startswith("\n"):
         prefix += "\n"
     backup = path.with_suffix(path.suffix + ".blogmanager.bak")
-    temp_path = path.with_suffix(path.suffix + ".blogmanager.tmp")
+    temp_path = path.with_name(path.name + "." + uuid.uuid4().hex + ".blogmanager.tmp")
     try:
         if not backup.exists():
             shutil.copy2(path, backup)
@@ -1183,7 +1278,7 @@ def auto_complete_post_frontmatter(root: Path) -> dict[str, list[dict[str, str]]
             errors.append({"relative_path": relative, "error": str(info["error"])})
             continue
         backup = path.with_suffix(path.suffix + ".blogmanager.bak")
-        temp_path = path.with_suffix(path.suffix + ".blogmanager.tmp")
+        temp_path = path.with_name(path.name + "." + uuid.uuid4().hex + ".blogmanager.tmp")
         try:
             metadata = CommentedMap()
             metadata["title"] = path.stem
@@ -1402,7 +1497,7 @@ def atomic_write_bytes(path: Path, data: bytes, error_prefix: str = "写入失�
     cleanup_runtime 会调用 os._exit(0)，它不会等待其它线程的写操作落盘，
     因此所有"覆盖已有文件"的写入都必须是原子的。
     """
-    temp_path = path.with_suffix(path.suffix + ".blogmanager.tmp")
+    temp_path = path.with_name(path.name + "." + uuid.uuid4().hex + ".blogmanager.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path.write_bytes(data)
@@ -1437,6 +1532,15 @@ def cleanup_stale_temp_files(root: Path) -> int:
     return removed
 
 
+def validate_filename(name: str) -> str:
+    stem = name.split(".", 1)[0].upper()
+    if (stem in {"CON", "PRN", "AUX", "NUL"}
+            or re.fullmatch(r"(?:COM|LPT)[1-9¹²³]", stem)
+            or any(ord(char) < 32 for char in name) or len(name.encode("utf-8")) > 240):
+        raise ApiError("文件名包含保留名称、控制字符或过长，请换一个名称。")
+    return name
+
+
 def safe_filename(title: str, filename: str = "") -> str:
     raw = normalize_text(filename, "文件名") or normalize_text(title, "标题") or "untitled"
     raw = Path(raw).name
@@ -1445,7 +1549,7 @@ def safe_filename(title: str, filename: str = "") -> str:
         raw = "untitled"
     if not raw.lower().endswith((".md", ".markdown")):
         raw += ".md"
-    return raw
+    return validate_filename(raw)
 
 class Task:
     def __init__(self, kind: str, command: str, cwd: Path, port: int | None = None):
@@ -1482,7 +1586,7 @@ class Task:
             self.condition.notify_all()
 
     def emit(self, text: str, level: str = "stdout") -> None:
-        clean_text = ANSI_ESCAPE.sub("", str(text)).rstrip("\r\n")
+        clean_text = redact_sensitive(ANSI_ESCAPE.sub("", str(text))).rstrip("\r\n")
         with self.condition:
             item = {
                 "seq": self.emit_seq() + 1,
@@ -1506,7 +1610,10 @@ class Task:
         overflow = len(self.events) - MAX_TASK_LINES
         if overflow > 0:
             del self.events[:overflow]
-            del self.lines[:overflow]
+            self.output_truncated = True
+        line_overflow = len(self.lines) - MAX_TASK_LINES
+        if line_overflow > 0:
+            del self.lines[:line_overflow]
             self.output_truncated = True
 
     def emit_step(self, step_id: str, status: str, detail: str = "") -> None:
@@ -1515,7 +1622,7 @@ class Task:
                 if step["id"] == step_id:
                     step["status"] = status
                     if detail:
-                        step["detail"] = detail
+                        step["detail"] = redact_sensitive(detail)
                     break
             self.events.append(
                 {
@@ -1524,7 +1631,7 @@ class Task:
                     "time": datetime.now().strftime("%H:%M:%S"),
                     "id": step_id,
                     "status": status,
-                    "detail": detail,
+                    "detail": redact_sensitive(detail),
                 }
             )
             self._trim_output()
@@ -1544,13 +1651,13 @@ class Task:
             return {
                 "id": self.id,
                 "kind": self.kind,
-                "command": self.command,
+                "command": redact_sensitive(self.command),
                 "cwd": self.cwd,
                 "port": self.port,
                 "pid": self.pid,
                 "local_only": self.local_only,
                 "failed_step": self.failed_step,
-                "error_message": self.error_message,
+                "error_message": redact_sensitive(self.error_message),
                 "steps": copy.deepcopy(self.steps),
                 "status": self.status,
                 "exit_code": self.exit_code,
@@ -1584,7 +1691,8 @@ class TaskManager:
 
         返回 (task, created)。created 为 False 时 task 是已在运行的那个。
         """
-        wanted = kinds or (kind,)
+        mutating_kinds = ("preview", "generate", "deploy", "dependencies", "autodeploy", "clone")
+        wanted = kinds or (mutating_kinds if kind in mutating_kinds else (kind,))
         with self.lock:
             for task in reversed(list(self.tasks.values())):
                 if task.kind in wanted and task.status == "running":
@@ -1663,6 +1771,8 @@ def hexo_command(target: Path, args: list[str]) -> list[str]:
     local_hexo = target / "node_modules" / ".bin" / local_name
     if local_hexo.is_file():
         if os.name == "nt":
+            if re.search(r'[\r\n\x00&|<>^%!]', str(local_hexo)):
+                raise ApiError("博客路径包含 Windows 命令解释器不安全字符，请移动到普通路径。")
             return ["cmd.exe", "/d", "/s", "/c", "call", str(local_hexo), *args]
         return [str(local_hexo), *args]
     return command_executable("npx", ["--yes", "hexo", *args])
@@ -1671,7 +1781,7 @@ def hexo_command(target: Path, args: list[str]) -> list[str]:
 def command_for(kind: str, port: int | None = None, target: Path | None = None) -> tuple[str, list[str]]:
     cwd = Path(target or Path.cwd())
     if kind == "deploy":
-        command_text = "hexo clean && hexo deploy"
+        command_text = "hexo clean && hexo generate && hexo deploy"
         command_args = ["cmd.exe", "/d", "/s", "/c", command_text] if os.name == "nt" else ["/bin/sh", "-lc", command_text]
         return command_text, command_args
     if kind == "preview":
@@ -1706,18 +1816,19 @@ def run_process(task: Task) -> None:
             stdin=subprocess.DEVNULL,
             # 以字节读取再逐行解码：cmd.exe 在中文 Windows 上按 GBK 输出，
             # 统一按 UTF-8 解码会把 "系统找不到指定的路径。" 变成 U+FFFD。
-            bufsize=1,
+            bufsize=-1,
             env=env,
             creationflags=NO_WINDOW,
             **popen_options,
         )
         task.process = process
+        if task.stop_requested:
+            terminate_process_tree(process)
         with task.condition:
             task.pid = process.pid
             task.condition.notify_all()
         assert process.stdout is not None
         output_tail: list[str] = []
-        logged_output = 0
         for raw_line in iter(process.stdout.readline, b""):
             line = decode_command_output(raw_line)
             task.emit(line)
@@ -1726,9 +1837,8 @@ def run_process(task: Task) -> None:
                 output_tail.append(cleaned)
                 if len(output_tail) > 30:
                     output_tail.pop(0)
-                if logged_output < 80:
-                    LOGGER.info("command output | kind=%s | %s", task.kind, cleaned)
-                    logged_output += 1
+                LOGGER.info("command output | kind=%s | %s", task.kind, cleaned)
+        process.stdout.close()
         exit_code = process.wait()
         if task.stop_requested:
             LOGGER.warning("task stopped | kind=%s | command=%s", task.kind, display_command)
@@ -1918,6 +2028,15 @@ def run_deploy_process(task: Task) -> None:
             return
         if code != 0:
             raise AutodeployError("hexo clean 失败，请查看上方日志。")
+        code, repair = run_generate_with_auto_repair(task, target)
+        if task.stop_requested:
+            task.finish("stopped", None)
+            return
+        if code != 0:
+            raise AutodeployError("hexo generate 失败，已取消部署，请先修复文章或主题问题。")
+        output = emit_generated_output_status(task, target)
+        if output["pug_count"]:
+            raise AutodeployError("主题模板未正确渲染，已取消部署，请先修复渲染器依赖。")
         code = run_task_command(task, hexo_command(target, ["deploy"]), target, "hexo deploy")
         if task.stop_requested:
             task.emit("部署已停止。", "warning")
@@ -2086,19 +2205,57 @@ def guard_state_changing_requests() -> None:
     浏览器允许跨站发起 CORS 简单请求（表单、multipart），因此不校验来源时，
     任意网页都可以 POST /api/posts、/api/images/upload 甚至 /api/app/exit。
     """
-    if request.method in {"GET", "HEAD", "OPTIONS"}:
-        return
     host_header = request.host
     if host_without_port(host_header) not in LOCAL_HOSTNAMES:
         raise ApiError("拒绝非本机来源的请求。", 403)
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return
+    if request.headers.get("Sec-Fetch-Site") == "cross-site":
+        raise ApiError("拒绝来自其他网站的跨站请求。", 403)
     origin = request.headers.get("Origin")
     if origin:
         if origin.lower() not in allowed_request_origins(host_header):
             raise ApiError("拒绝来自其他网站的跨站请求。", 403)
         return
     referer = request.headers.get("Referer")
-    if referer and host_without_port(urlparse(referer).netloc) not in LOCAL_HOSTNAMES:
+    if referer and (f"{urlparse(referer).scheme}://{urlparse(referer).netloc}".lower() not in allowed_request_origins(host_header)):
         raise ApiError("拒绝来自其他网站的跨站请求。", 403)
+
+
+@app.before_request
+def serialize_mutations() -> None:
+    if (request.method not in {"GET", "HEAD", "OPTIONS"}
+            and not request.path.startswith("/api/client/")
+            and request.path != "/api/app/exit"
+            and not request.path.endswith("/stop")):
+        from flask import g
+        MUTATION_LOCK.acquire()
+        g.mutation_locked = True
+        switching = request.path in {"/api/select-folder", "/api/blog-directory", "/api/onboarding", "/api/config/reset"}
+        if request.path == "/api/settings":
+            payload = request.get_json(silent=True)
+            switching = isinstance(payload, dict) and bool(payload.get("path"))
+        if switching:
+            with task_manager.lock:
+                if any(item.status == "running" for item in task_manager.tasks.values()):
+                    raise ApiError("有任务正在使用当前博客，请先停止任务再切换或重置目录。", 409)
+
+
+@app.teardown_request
+def release_mutation_lock(error: BaseException | None) -> None:
+    from flask import g
+    if g.pop("mutation_locked", False):
+        MUTATION_LOCK.release()
+
+
+@app.after_request
+def security_headers(response: Response) -> Response:
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Frame-Options"] = "DENY"
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/")
@@ -2121,15 +2278,28 @@ def consume_cleanup_report() -> dict[str, Any] | None:
         return None
     return None if report.get("ok") else report
 
+def persistent_log_lines() -> list[str]:
+    handlers = [handler for handler in LOGGER.handlers if isinstance(handler, RotatingFileHandler)]
+    for handler in handlers:
+        handler.acquire()
+    try:
+        lines: list[str] = []
+        for index in (3, 2, 1, 0):
+            path = Path(f"{LOG_FILE}.{index}") if index else LOG_FILE
+            if path.exists():
+                lines.extend(redact_sensitive(line) for line in path.read_text(encoding="utf-8", errors="replace").splitlines())
+        return lines
+    except OSError as exc:
+        raise ApiError(f"读取历史日志失败：{exc}") from exc
+    finally:
+        for handler in reversed(handlers):
+            handler.release()
+
+
 def read_persistent_logs(limit: int = 200, offset: int = 0) -> dict[str, Any]:
     limit = max(1, min(int(limit), 1000))
     offset = max(0, int(offset))
-    if not LOG_FILE.exists():
-        return {"lines": [], "total": 0, "offset": 0, "has_more": False}
-    try:
-        lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError as exc:
-        raise ApiError(f"读取历史日志失败：{exc}") from exc
+    lines = persistent_log_lines()
     total = len(lines)
     end = max(0, total - offset)
     start = max(0, end - limit)
@@ -2174,10 +2344,8 @@ def api_logs() -> Response:
 
 @app.get("/api/logs/download")
 def api_download_logs() -> Response:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    if not LOG_FILE.exists():
-        LOG_FILE.touch()
-    return send_file(LOG_FILE, as_attachment=True, download_name="blogmanager.log")
+    data = "\n".join(persistent_log_lines()).encode("utf-8")
+    return send_file(io.BytesIO(data), as_attachment=True, download_name="blogmanager.log", mimetype="text/plain")
 
 
 @app.delete("/api/logs")
@@ -2704,7 +2872,7 @@ def api_preview_dependencies() -> Response:
 def api_deploy() -> Response:
     cwd = require_blog_directory()
     task, created = start_runner_task(
-        "deploy", "hexo clean && hexo deploy", cwd, run_deploy_process
+        "deploy", "hexo clean && hexo generate && hexo deploy", cwd, run_deploy_process
     )
     if not created:
         raise ApiError("已有部署任务正在运行，请等待它结束或先停止它。", 409, {"task": task.snapshot()})
@@ -2712,6 +2880,8 @@ def api_deploy() -> Response:
 
 @app.post("/api/commands/preview")
 def api_preview() -> Response:
+    payload = json_payload() if request.data else {}
+    port = validate_port(payload.get("port", 4000))
     cwd = require_blog_directory()
     # 先停掉旧预览；随后用 create_if_idle 原子创建，避免并发请求各起一个预览
     running = task_manager.running("preview")
@@ -2730,8 +2900,6 @@ def api_preview() -> Response:
             409,
             {"dependency_issue": True, "dependency_status": dependency_status},
         )
-    payload = request.get_json(silent=True) or {}
-    port = validate_port(payload.get("port", 4000))
     if port_is_occupied(port):
         raise ApiError(
             f"预览端口 {port} 已被占用。",
@@ -2837,7 +3005,7 @@ def api_task_events(task_id: str) -> Response:
 
 @app.get("/api/posts")
 def api_posts() -> Response:
-    root = require_blog_directory() / "source" / "_posts"
+    root = ensure_child_path(require_blog_directory(), "source/_posts")
     posts = []
     for path in list_files(root, POST_EXTENSIONS):
         metadata = parse_post_metadata(path)
@@ -2869,7 +3037,7 @@ def api_posts() -> Response:
 
 @app.post("/api/posts/frontmatter/repair")
 def api_repair_post_frontmatter() -> Response:
-    root = require_blog_directory() / "source" / "_posts"
+    root = ensure_child_path(require_blog_directory(), "source/_posts")
     payload = json_payload()
     relative_paths = payload.get("relative_paths")
     if relative_paths is not None and not isinstance(relative_paths, list):
@@ -2885,7 +3053,7 @@ def api_repair_post_frontmatter() -> Response:
 
 @app.get("/api/posts/frontmatter")
 def api_get_post_frontmatter() -> Response:
-    root = require_blog_directory() / "source" / "_posts"
+    root = ensure_child_path(require_blog_directory(), "source/_posts")
     path = ensure_child_path(root, request.args.get("relative_path", ""))
     if not path.exists() or not path.is_file() or path.suffix.lower() not in POST_EXTENSIONS:
         raise ApiError("文章不存在或不是 Markdown 文件。", 404)
@@ -2910,7 +3078,7 @@ def api_get_post_frontmatter() -> Response:
 
 @app.post("/api/posts/frontmatter")
 def api_update_post_frontmatter() -> Response:
-    root = require_blog_directory() / "source" / "_posts"
+    root = ensure_child_path(require_blog_directory(), "source/_posts")
     payload = json_payload()
     path = ensure_child_path(root, str(payload.get("relative_path", "")))
     if not path.exists() or not path.is_file() or path.suffix.lower() not in POST_EXTENSIONS:
@@ -2933,7 +3101,7 @@ def api_update_post_frontmatter() -> Response:
         prefix += "\n"
     new_content = prefix + body
     backup = path.with_suffix(path.suffix + ".blogmanager.bak")
-    temp_path = path.with_suffix(path.suffix + ".blogmanager.tmp")
+    temp_path = path.with_name(path.name + "." + uuid.uuid4().hex + ".blogmanager.tmp")
     try:
         if not backup.exists():
             shutil.copy2(path, backup)
@@ -2960,7 +3128,7 @@ def api_create_post() -> Response:
     title = normalize_text(payload.get("title"), "标题")
     if not title:
         raise ApiError("文章标题不能为空。")
-    root = require_blog_directory() / "source" / "_posts"
+    root = ensure_child_path(require_blog_directory(), "source/_posts")
     root.mkdir(parents=True, exist_ok=True)
     filename = safe_filename(title, str(payload.get("filename", "")))
     folder = normalize_text(payload.get("folder"), "文件夹")
@@ -2994,12 +3162,14 @@ def api_create_post() -> Response:
 
 @app.get("/api/posts/content")
 def api_get_post_content() -> Response:
-    root = require_blog_directory() / "source" / "_posts"
+    root = ensure_child_path(require_blog_directory(), "source/_posts")
     path = ensure_child_path(root, request.args.get("relative_path", ""))
-    if not path.exists() or not path.is_file():
-        raise ApiError("文章不存在。", 404)
+    if not path.exists() or not path.is_file() or path.suffix.lower() not in POST_EXTENSIONS:
+        raise ApiError("文章不存在或不是 Markdown 文件。", 404)
     try:
-        content = path.read_text(encoding="utf-8")
+        if path.stat().st_size > MAX_TEXT_FILE_BYTES:
+            raise ApiError("文章超过 8 MB，请使用外部编辑器处理。", 413)
+        content = path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError as exc:
         raise ApiError("文章不是有效的 UTF-8 文件。") from exc
     except OSError as exc:
@@ -3009,16 +3179,18 @@ def api_get_post_content() -> Response:
 
 @app.put("/api/posts/content")
 def api_update_post_content() -> Response:
-    root = require_blog_directory() / "source" / "_posts"
+    root = ensure_child_path(require_blog_directory(), "source/_posts")
     payload = json_payload()
     path = ensure_child_path(root, str(payload.get("relative_path", "")))
-    if not path.exists() or not path.is_file():
-        raise ApiError("文章不存在。", 404)
+    if not path.exists() or not path.is_file() or path.suffix.lower() not in POST_EXTENSIONS:
+        raise ApiError("文章不存在或不是 Markdown 文件。", 404)
     content = payload.get("content")
     if not isinstance(content, str):
         raise ApiError("content 必须是文本。")
+    if len(content.encode("utf-8")) > MAX_TEXT_FILE_BYTES:
+        raise ApiError("文章超过 8 MB，请使用外部编辑器处理。", 413)
     backup = path.with_suffix(path.suffix + ".blogmanager.bak")
-    temp_path = path.with_suffix(path.suffix + ".blogmanager.tmp")
+    temp_path = path.with_name(path.name + "." + uuid.uuid4().hex + ".blogmanager.tmp")
     try:
         if not backup.exists():
             shutil.copy2(path, backup)
@@ -3035,11 +3207,11 @@ def api_update_post_content() -> Response:
 
 @app.post("/api/posts/open")
 def api_open_post() -> Response:
-    root = require_blog_directory() / "source" / "_posts"
+    root = ensure_child_path(require_blog_directory(), "source/_posts")
     payload = json_payload()
     path = ensure_child_path(root, str(payload.get("relative_path", "")))
-    if not path.exists() or not path.is_file():
-        raise ApiError("文章不存在。", 404)
+    if not path.exists() or not path.is_file() or path.suffix.lower() not in POST_EXTENSIONS:
+        raise ApiError("文章不存在或不是 Markdown 文件。", 404)
     try:
         open_with_default_app(path)
     except Exception as exc:
@@ -3049,12 +3221,12 @@ def api_open_post() -> Response:
 
 @app.delete("/api/posts")
 def api_delete_post() -> Response:
-    root = require_blog_directory() / "source" / "_posts"
+    root = ensure_child_path(require_blog_directory(), "source/_posts")
     payload = json_payload()
     relative = str(payload.get("relative_path", ""))
     path = ensure_child_path(root, relative)
-    if not path.exists() or not path.is_file():
-        raise ApiError("文章不存在。", 404)
+    if not path.exists() or not path.is_file() or path.suffix.lower() not in POST_EXTENSIONS:
+        raise ApiError("文章不存在或不是 Markdown 文件。", 404)
     migrate_legacy_trash(root)
     target, cleanup = move_post_to_trash(root, path)
     try:
@@ -3072,7 +3244,7 @@ def api_delete_post() -> Response:
 
 @app.post("/api/posts/trash/cleanup")
 def api_cleanup_trash() -> Response:
-    root = require_blog_directory() / "source" / "_posts"
+    root = ensure_child_path(require_blog_directory(), "source/_posts")
     migrate = migrate_legacy_trash(root)
     cleanup = cleanup_trash()
     return jsonify({"ok": True, "migration": migrate, "cleanup": cleanup})
@@ -3104,7 +3276,7 @@ def safe_image_filename(
         labels = "、".join(sorted(item.lstrip(".").upper() for item in allowed))
         raise ApiError(f"只支持 {labels} 图片。")
     stem = re.sub(r'[\\/:*?"<>|]+', "-", Path(raw).stem).strip(" .") or "cover"
-    return f"{stem}{suffix}"
+    return validate_filename(f"{stem}{suffix}")
 
 
 def unique_image_target(root: Path, filename: str, reserved: set[str] | None = None) -> Path:
@@ -3113,6 +3285,8 @@ def unique_image_target(root: Path, filename: str, reserved: set[str] | None = N
     stem = Path(filename).stem
     suffix = Path(filename).suffix
     candidate = root / filename
+    existing = {item.name.casefold() for item in root.iterdir()} if root.exists() else set()
+    taken = taken | existing
     if not candidate.exists() and filename.casefold() not in taken:
         return candidate
     index = 1
@@ -3157,7 +3331,34 @@ def safe_image_filename_ci(filename: str, allowed: set[str]) -> str:
     if suffix not in allowed:
         raise ApiError(f"只支持 {image_format_labels(allowed)} 图片。", 415)
     stem = re.sub(r'[\\/:*?"<>|]+', "-", Path(raw).stem).strip(" .") or "image"
-    return f"{stem}{suffix}"
+    return validate_filename(f"{stem}{suffix}")
+
+
+def validate_image_data(data: bytes, suffix: str) -> None:
+    # Header checks reject renamed text/executables. This is not a full image decoder.
+    signatures = {
+        ".png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+        ".jpg": data.startswith(b"\xff\xd8\xff"),
+        ".jpeg": data.startswith(b"\xff\xd8\xff"),
+        ".gif": data.startswith((b"GIF87a", b"GIF89a")),
+        ".bmp": data.startswith(b"BM"),
+        ".ico": data.startswith(b"\x00\x00\x01\x00"),
+        ".webp": data.startswith(b"RIFF") and data[8:12] == b"WEBP",
+        ".avif": data[4:8] == b"ftyp" and any(brand in data[8:64] for brand in (b"avif", b"avis")),
+    }
+    if suffix == ".svg":
+        import xml.etree.ElementTree as ET
+        if b"<!DOCTYPE" in data.upper() or b"<!ENTITY" in data.upper():
+            raise ApiError("SVG 不允许 DTD 或实体声明。", 415)
+        try:
+            element = ET.fromstring(data)
+            valid = element.tag in {"svg", "{http://www.w3.org/2000/svg}svg"}
+        except (ET.ParseError, ValueError):
+            valid = False
+    else:
+        valid = signatures.get(suffix.lower(), False)
+    if not valid:
+        raise ApiError("文件内容与图片格式不符。", 415)
 
 
 def save_uploaded_image(root: Path, upload: Any, allowed: set[str], reserved: set[str]) -> dict[str, Any]:
@@ -3186,8 +3387,12 @@ def save_uploaded_image(root: Path, upload: Any, allowed: set[str], reserved: se
     if not size:
         return {"name": label, "ok": False, "error": "文件内容为空。"}
 
+    try:
+        validate_image_data(data, Path(filename).suffix)
+    except ApiError as exc:
+        return {"name": label, "ok": False, "error": str(exc)}
     target = unique_image_target(root, filename, reserved)
-    temp_path = target.with_suffix(target.suffix + ".blogmanager.tmp")
+    temp_path = target.with_name(target.name + "." + uuid.uuid4().hex + ".blogmanager.tmp")
     try:
         temp_path.write_bytes(data)
         os.replace(temp_path, target)
@@ -3215,7 +3420,7 @@ def image_payload(path: Path, root: Path) -> dict[str, Any]:
 
 @app.get("/api/images")
 def api_images() -> Response:
-    root = require_blog_directory() / "source" / "img"
+    root = ensure_child_path(require_blog_directory(), "source/img")
     images = [image_payload(path, root) for path in list_files(root, IMAGE_EXTENSIONS)]
     if request.args.get("sort") == "name":
         images.sort(key=lambda item: item["name"].casefold())
@@ -3227,7 +3432,7 @@ def api_images() -> Response:
 @app.post("/api/images/upload")
 def api_upload_image() -> Response:
     """上传图片。兼容两种调用：file（单文件，原有行为）与 files（多文件，拖拽上传）。"""
-    root = require_blog_directory() / "source" / "img"
+    root = ensure_child_path(require_blog_directory(), "source/img")
     root.mkdir(parents=True, exist_ok=True)
     scope = str(request.form.get("scope", "cover") or "cover").strip().lower()
     allowed = allowed_image_extensions(scope)
@@ -3243,7 +3448,8 @@ def api_upload_image() -> Response:
         raise ApiError("请选择要上传的图片文件。")
 
     reserved: set[str] = set()
-    results = [save_uploaded_image(root, upload, allowed, reserved) for upload in uploads]
+    with IMAGE_WRITE_LOCK:
+        results = [save_uploaded_image(root, upload, allowed, reserved) for upload in uploads]
     succeeded = [item for item in results if item["ok"]]
     failed = [item for item in results if not item["ok"]]
     limit_mb = max_image_upload_bytes() // (1024 * 1024)
@@ -3285,8 +3491,8 @@ def assert_public_http_url(url: str) -> None:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ApiError("请输入有效的 http 或 https 图片 URL。")
     host = parsed.hostname or ""
-    if not host:
-        raise ApiError("请输入有效的 http 或 https 图片 URL。")
+    if not host or parsed.username or parsed.password:
+        raise ApiError("请输入不包含用户名或密码的 http 或 https 图片 URL。")
     if host.lower() in {"localhost", "localhost.localdomain"} or host.lower().endswith(".localhost"):
         raise ApiError("出于安全考虑，不能从本机地址下载图片。", 403)
     try:
@@ -3308,6 +3514,12 @@ def assert_public_http_url(url: str) -> None:
             raise ApiError("出于安全考虑，不能从本机或内网地址下载图片。", 403)
 
 
+class PublicImageRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        assert_public_http_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 @app.post("/api/images/from-url")
 def api_image_from_url() -> Response:
     payload = json_payload()
@@ -3316,7 +3528,8 @@ def api_image_from_url() -> Response:
     parsed = urlparse(url)
     request_obj = Request(url, headers={"User-Agent": "BlogManager/1.0", "Accept": "image/*"}, method="GET")
     try:
-        with urlopen(request_obj, timeout=20) as response:
+        with build_opener(PublicImageRedirectHandler()).open(request_obj, timeout=20) as response:
+            assert_public_http_url(response.geturl())
             content_type = response.headers.get_content_type()
             data = response.read(25 * 1024 * 1024 + 1)
     except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
@@ -3353,29 +3566,35 @@ def api_image_from_url() -> Response:
             {"url": url, "download_failed": True},
         )
     filename = safe_image_filename(f"{Path(parsed.path).stem or 'cover'}{suffix}", allowed_extensions)
-    root = require_blog_directory() / "source" / "img"
+    root = ensure_child_path(require_blog_directory(), "source/img")
     root.mkdir(parents=True, exist_ok=True)
-    target = unique_image_target(root, filename)
-    atomic_write_bytes(target, data, "保存下载图片失败")
+    validate_image_data(data, suffix)
+    with IMAGE_WRITE_LOCK:
+        target = unique_image_target(root, filename)
+        atomic_write_bytes(target, data, "保存下载图片失败")
     return jsonify({"ok": True, "image": image_payload(target, root)}), 201
 
 
 @app.get("/api/images/file")
 def api_image_file() -> Response:
-    root = require_blog_directory() / "source" / "img"
+    root = ensure_child_path(require_blog_directory(), "source/img")
     path = ensure_child_path(root, request.args.get("path", ""))
     if not path.exists() or not path.is_file():
         raise ApiError("图片不存在。", 404)
     mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    return send_file(path, mimetype=mime, conditional=True, max_age=0)
+    if path.suffix.lower() not in IMAGE_EXTENSIONS:
+        raise ApiError("只能读取图片文件。", 403)
+    response = send_file(path, mimetype=mime, conditional=True, max_age=0)
+    response.headers["Content-Security-Policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'"
+    return response
 
 
 @app.post("/api/images/rename")
 def api_rename_image() -> Response:
-    root = require_blog_directory() / "source" / "img"
+    root = ensure_child_path(require_blog_directory(), "source/img")
     payload = json_payload()
     source = ensure_child_path(root, str(payload.get("relative_path", "")))
-    if not source.exists() or not source.is_file():
+    if not source.exists() or not source.is_file() or source.suffix.lower() not in IMAGE_EXTENSIONS:
         raise ApiError("图片不存在。", 404)
     requested = normalize_text(payload.get("new_name"), "新文件名")
     if not requested:
@@ -3387,7 +3606,7 @@ def api_rename_image() -> Response:
     original_suffix = source.suffix
     requested_path = Path(requested)
     new_stem = requested_path.stem if requested_path.suffix else requested
-    requested = f"{new_stem}{original_suffix}"
+    requested = validate_filename(f"{new_stem}{original_suffix}")
     relative_directory = source.parent.relative_to(root)
     target = ensure_child_path(root, (relative_directory / requested).as_posix())
     if target == source:
@@ -3406,7 +3625,7 @@ def api_rename_image() -> Response:
 
 @app.post("/api/images/open-folder")
 def api_open_image_folder() -> Response:
-    root = require_blog_directory() / "source" / "img"
+    root = ensure_child_path(require_blog_directory(), "source/img")
     payload = json_payload()
     path = ensure_child_path(root, str(payload.get("relative_path", "")))
     folder = path.parent if path.is_file() else path
@@ -3427,6 +3646,8 @@ def command_executable(name: str, args: list[str]) -> list[str]:
     if not executable:
         raise AutodeployError(f"找不到 {name}，请先安装并将其加入 PATH。")
     if os.name == "nt" and Path(executable).suffix.lower() in {".cmd", ".bat"}:
+        if any(re.search(r'[\r\n\x00&|<>^%!]', arg) for arg in [executable, *args]):
+            raise AutodeployError("命令参数或路径包含 Windows 命令解释器不安全字符。")
         return ["cmd.exe", "/d", "/s", "/c", "call", executable, *args]
     return [executable, *args]
 
@@ -3437,6 +3658,8 @@ def run_task_command(
     cwd: Path,
     display_command: str | None = None,
 ) -> int:
+    if task.stop_requested:
+        raise AutodeployError("任务已取消。")
     display = display_command or subprocess.list2cmdline(args)
     LOGGER.info("command start | cwd=%s | command=%s", cwd, display)
     task.emit(f"$ {display}", "system")
@@ -3454,7 +3677,7 @@ def run_task_command(
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         # 字节读取后逐行解码，兼容 cmd.exe / git 在中文 Windows 上的 GBK 输出
-        bufsize=1,
+        bufsize=-1,
         env=env,
         creationflags=NO_WINDOW,
         **options,
@@ -3463,32 +3686,55 @@ def run_task_command(
         task.process = process
         task.pid = process.pid
         task.condition.notify_all()
-    assert process.stdout is not None
-    output_tail: list[str] = []
-    logged_output = 0
-    for raw_line in iter(process.stdout.readline, b""):
-        line = decode_command_output(raw_line)
-        task.emit(line)
-        cleaned = str(line).strip()
-        if cleaned:
-            output_tail.append(cleaned)
-            if len(output_tail) > 30:
-                output_tail.pop(0)
-            if logged_output < 80:
+    if task.stop_requested:
+        terminate_process_tree(process)
+    try:
+        timeout_seconds = max(1, int(os.environ.get("BLOG_MANAGER_COMMAND_TIMEOUT", "600")))
+    except ValueError:
+        timeout_seconds = 600
+    timed_out = threading.Event()
+    def abort_on_timeout() -> None:
+        if process.poll() is None:
+            timed_out.set()
+            task.emit(f"命令超过 {timeout_seconds} 秒未完成，已终止；请检查网络或调整 BLOG_MANAGER_COMMAND_TIMEOUT。", "error")
+            terminate_process_tree(process)
+    timer = threading.Timer(timeout_seconds, abort_on_timeout)
+    timer.daemon = True
+    timer.start()
+    try:
+        assert process.stdout is not None
+        output_tail: list[str] = []
+        for raw_line in iter(process.stdout.readline, b""):
+            line = decode_command_output(raw_line)
+            task.emit(line)
+            cleaned = str(line).strip()
+            if cleaned:
+                output_tail.append(cleaned)
+                if len(output_tail) > 30:
+                    output_tail.pop(0)
                 LOGGER.info("command output | command=%s | %s", display, cleaned)
-                logged_output += 1
-    exit_code = process.wait()
-    if exit_code == 0:
-        LOGGER.info("command complete | code=0 | cwd=%s | command=%s", cwd, display)
-    else:
-        LOGGER.error(
-            "command failed | code=%s | cwd=%s | command=%s | tail=%s",
-            exit_code,
-            cwd,
-            display,
-            " | ".join(output_tail[-10:]),
-        )
-    return exit_code
+        process.stdout.close()
+        exit_code = process.wait()
+        if exit_code == 0:
+            LOGGER.info("command complete | code=0 | cwd=%s | command=%s", cwd, display)
+        else:
+            LOGGER.error(
+                "command failed | code=%s | cwd=%s | command=%s | tail=%s",
+                exit_code,
+                cwd,
+                display,
+                " | ".join(output_tail[-10:]),
+            )
+        return -1 if timed_out.is_set() else exit_code
+    finally:
+        timer.cancel()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.poll() is None:
+            terminate_process_tree(process)
+
+
+
 
 
 def inspect_target_folder(path: Path) -> dict[str, Any]:
@@ -3761,6 +4007,18 @@ def api_ensure_github_repo() -> Response:
     return jsonify(ensure_github_repository(repo_url, token, private))
 
 
+def validate_repo_address(value: str, label: str = "仓库地址") -> None:
+    if not value or value.startswith("-") or re.search(r'[\s\x00-\x1f&|<>^%!"]', value):
+        raise ApiError(f"{label}格式不正确或包含不安全字符。")
+    parsed = urlparse(value)
+    if parsed.password or (parsed.scheme in {"http", "https"} and parsed.username):
+        raise ApiError(f"{label}不能包含明文用户名、密码或 Token。")
+    if parsed.scheme in {"http", "https", "ssh"} and not parsed.hostname:
+        raise ApiError(f"{label}缺少主机名。")
+    if parsed.scheme not in {"http", "https", "ssh"} and not re.fullmatch(r"[\w.-]+@[\w.-]+:[^\s]+", value):
+        raise ApiError(f"{label}必须为 HTTP(S)、SSH 或 git@host:path 地址。")
+
+
 def validate_autodeploy_payload(payload: dict[str, Any]) -> dict[str, Any]:
     target_text = normalize_text(payload.get("target_dir"), "目标文件夹")
     if not target_text:
@@ -3786,17 +4044,11 @@ def validate_autodeploy_payload(payload: dict[str, Any]) -> dict[str, Any]:
     branch = normalize_text(payload.get("branch"), "分支") or "main"
     theme_repo = normalize_text(payload.get("theme_repo"), "主题仓库") or "https://github.com/jerryc127/hexo-theme-butterfly.git"
     for value, label in ((repo_url, "仓库地址"), (theme_repo, "主题仓库")):
-        if value and any(char in value for char in ('\n', '\r', '&', '|', '<', '>')):
-            raise ApiError(f"{label}包含不安全字符。")
-        # 带 userinfo 的 HTTPS 地址会把 PAT 明文写进博客 _config.yml 并可能被提交
-        if value and urlparse(value).username:
-            raise ApiError(
-                f"{label}不能包含用户名或 Token（如 https://token@github.com/...）。"
-                "请改用 SSH 地址 git@github.com:用户名/仓库.git。"
-            )
+        if value:
+            validate_repo_address(value, label)
     if not local_only and not repo_url:
         raise ApiError("请填写 GitHub 仓库地址。")
-    if not re.fullmatch(r"[A-Za-z0-9._/-]+", branch):
+    if branch.startswith("-") or not re.fullmatch(r"[A-Za-z0-9._/-]+", branch):
         raise ApiError("Git 分支名称格式不正确。")
     return {
         "target": target,
@@ -3870,6 +4122,9 @@ def apply_autodeploy_config(target: Path, options: dict[str, Any], task: Task) -
     task.emit("正在应用当前博客配置...", "system")
     if options.get("local_only"):
         target_site = load_yaml_file(target / SITE_CONFIG_NAME, allow_missing=True)
+        for key in ("title", "author", "url"):
+            if options.get(key):
+                target_site[key] = options[key]
         target_site["theme"] = "landscape" if options.get("skip_theme") else "butterfly"
         target_site.pop("deploy", None)
         write_yaml_file(target / SITE_CONFIG_NAME, target_site)
@@ -4065,13 +4320,15 @@ def theme_dir_is_usable(theme_dir: Path) -> bool:
 def check_theme_source(url: str, timeout: float = 5.0) -> bool:
     if not url:
         return False
-    request_obj = Request(url, headers={"User-Agent": "BlogManager/1.0"}, method="GET")
     try:
-        with urlopen(request_obj, timeout=timeout) as response:
+        assert_public_http_url(url)
+        request_obj = Request(url, headers={"User-Agent": "BlogManager/1.0"}, method="GET")
+        with build_opener(PublicImageRedirectHandler()).open(request_obj, timeout=timeout) as response:
+            assert_public_http_url(response.geturl())
             return response.status < 500
     except HTTPError as exc:
         return exc.code < 500
-    except (URLError, TimeoutError, OSError, ValueError):
+    except (ApiError, URLError, TimeoutError, OSError, ValueError):
         return False
 
 
@@ -4533,6 +4790,9 @@ def run_autodeploy(task: Task, options: dict[str, Any]) -> None:
 def api_autodeploy() -> Response:
     payload = json_payload()
     options = validate_autodeploy_payload(payload)
+    with task_manager.lock:
+        if any(item.status == "running" for item in task_manager.tasks.values()):
+            raise ApiError("已有任务正在运行，请先停止或等待完成。", 409)
     saved = {
         "title": options["title"],
         "author": options["author"],
@@ -4555,6 +4815,8 @@ def api_autodeploy() -> Response:
         github_updates["remember"] = True
     elif options["save_token"]:
         github_updates["remember"] = True
+    else:
+        github_updates.update({"token": "", "remember": False})
     settings_store.update_github(github_updates)
     if options["auto_create_repo"] and options["github_token"] and not options["local_only"]:
         ensure_github_repository(options["repo_url"], options["github_token"], options["repo_private"])
@@ -4655,43 +4917,16 @@ def terminate_port_processes(port: int, task: Task | None = None) -> tuple[list[
             known_pids.add(int(process.pid))
         if task.pid:
             known_pids.add(int(task.pid))
-    started_after = 0.0
-    if task is not None and task.started_at:
-        try:
-            started_after = datetime.fromisoformat(task.started_at).timestamp() - PORT_CLEANUP_KILL_GRACE_SECONDS
-        except (TypeError, ValueError):
-            started_after = 0.0
-
     killed: list[int] = []
     skipped: list[int] = []
     for pid in port_owner_pids(port):
-        if pid in known_pids:
-            if terminate_pid_tree(pid):
-                killed.append(pid)
-            else:
-                skipped.append(pid)
-            continue
-        image = process_image_name(pid)
-        if image not in PORT_CLEANUP_EXPECTED_IMAGES:
-            LOGGER.warning(
-                "port cleanup skipped | port=%s | pid=%s | image=%s | reason=unexpected-process",
-                port, pid, image or "unknown",
-            )
-            skipped.append(pid)
-            continue
-        if started_after:
-            created = pid_creation_time(pid)
-            if created and created < started_after:
-                LOGGER.warning(
-                    "port cleanup skipped | port=%s | pid=%s | image=%s | reason=started-before-task",
-                    port, pid, image,
-                )
-                skipped.append(pid)
-                continue
-        LOGGER.info("port cleanup kill | port=%s | pid=%s | image=%s", port, pid, image)
-        if terminate_pid_tree(pid):
+        # Name and creation time do not prove ownership. The process tree is
+        # stopped by taskkill /T above; never kill an unrelated port owner.
+        if (pid in known_pids and task is not None and task.process is not None
+                and task.process.poll() is None and terminate_pid_tree(pid)):
             killed.append(pid)
         else:
+            LOGGER.warning("port cleanup skipped | port=%s | pid=%s | reason=unconfirmed-ownership", port, pid)
             skipped.append(pid)
     return killed, skipped
 
@@ -4758,7 +4993,8 @@ def cleanup_runtime() -> dict[str, Any]:
         if SHUTTING_DOWN:
             return {"ok": True, "already_cleaning": True}
         SHUTTING_DOWN = True
-        browser_pids = list(BROWSER_PIDS)
+        browser_pids = [pid for pid in BROWSER_PIDS
+                        if pid in BROWSER_PROCESSES and BROWSER_PROCESSES[pid].poll() is None]
     task_manager.stop_all()
     stopped_tasks: list[str] = []
     with task_manager.lock:
@@ -4827,7 +5063,7 @@ def run_clone_blog(task: Task, target: Path, repo_url: str, branch: str) -> None
         clone_args = ["clone"]
         if branch:
             clone_args.extend(["--branch", branch])
-        clone_args.extend([repo_url, str(target)])
+        clone_args.extend(["--", repo_url, str(target)])
         code = run_task_command(task, command_executable("git", clone_args), target.parent)
         if code != 0:
             raise AutodeployError("Git 克隆失败，请检查仓库地址、分支、网络和访问权限。")
@@ -4854,11 +5090,15 @@ def run_clone_blog(task: Task, target: Path, repo_url: str, branch: str) -> None
 @app.post("/api/blog/clone")
 def api_clone_blog() -> Response:
     payload = json_payload()
-    target = Path(normalize_text(payload.get("target_dir"), "目标文件夹")).expanduser().resolve()
+    target_text = normalize_text(payload.get("target_dir"), "目标文件夹")
+    if not target_text:
+        raise ApiError("请先选择目标文件夹。")
+    target = Path(target_text).expanduser().resolve()
     repo_url = normalize_text(payload.get("repo_url"), "仓库地址")
     branch = normalize_text(payload.get("branch"), "分支")
-    if not repo_url or any(char in repo_url for char in ('\n', '\r', '&', '|', '<', '>')):
-        raise ApiError("请填写有效的 Git 仓库地址。")
+    validate_repo_address(repo_url)
+    if branch and (branch.startswith("-") or not re.fullmatch(r"[A-Za-z0-9._/-]+", branch)):
+        raise ApiError("Git 分支名称格式不正确。")
     inspect = inspect_target_folder(target)
     if inspect["exists"] and not inspect["empty"]:
         raise ApiError("克隆目标文件夹必须为空或不存在。", 409)
@@ -4881,8 +5121,9 @@ def api_retry_autodeploy(task_id: str) -> Response:
     if not isinstance(previous_options, Mapping) or not previous_options:
         raise ApiError("找不到该自动部署任务的可重试参数。", 404)
     options = copy.deepcopy(dict(previous_options))
-    payload = request.get_json(silent=True) or {}
+    payload = json_payload() if request.data else {}
     if isinstance(payload.get("theme_repo"), str) and payload["theme_repo"].strip():
+        validate_repo_address(payload["theme_repo"].strip(), "主题仓库")
         options["theme_repo"] = payload["theme_repo"].strip()
     if "skip_theme" in payload:
         options["skip_theme"] = bool(payload["skip_theme"])
@@ -4958,7 +5199,7 @@ def api_exit_app() -> Response:
 
 @app.errorhandler(ApiError)
 def handle_api_error(error: ApiError) -> tuple[Response, int]:
-    return jsonify({"error": str(error), "details": error.details}), error.status_code
+    return jsonify({"error": redact_sensitive(error), "details": error.details}), error.status_code
 
 
 @app.errorhandler(RequestEntityTooLarge)
@@ -4978,11 +5219,11 @@ def handle_payload_too_large(error: RequestEntityTooLarge) -> tuple[Response, in
 @app.errorhandler(Exception)
 def handle_unexpected_error(error: Exception) -> tuple[Response, int]:
     if isinstance(error, ApiError):
-        return jsonify({"error": str(error), "details": error.details}), error.status_code
+        return jsonify({"error": redact_sensitive(error), "details": error.details}), error.status_code
     if isinstance(error, HTTPException):
         return jsonify({"error": error.description, "details": None}), error.code or 500
     LOGGER.exception("Unhandled request error")
-    return jsonify({"error": f"服务器内部错误：{error}", "details": None}), 500
+    return jsonify({"error": "服务器内部错误，请查看本机日志了解详情。", "details": None}), 500
 
 
 def select_folder_dialog(initial_dir: Path) -> str:
@@ -5159,21 +5400,10 @@ def browser_process_snapshot() -> set[int]:
 
 
 def track_fallback_browser_processes(before: set[int]) -> list[int]:
-    time.sleep(0.8)
-    after = browser_process_snapshot()
-    new_pids = sorted(after - before)
-    if new_pids:
-        with BROWSER_LOCK:
-            for pid in new_pids:
-                if pid not in BROWSER_PIDS:
-                    BROWSER_PIDS.append(pid)
-        LOGGER.warning("fallback browser process tracked | pids=%s", new_pids)
-    else:
-        LOGGER.warning(
-            "fallback browser process could not be tracked by PID; "
-            "please close the browser window manually when finished"
-        )
-    return new_pids
+    # A new browser PID might belong to a window opened by the user. Snapshot
+    # differences do not establish ownership, so never register them for killing.
+    LOGGER.warning("默认浏览器由系统管理，无法确认进程归属；退出后请手动关闭此标签页。")
+    return []
 
 
 def open_app_window(url: str) -> None:
@@ -5187,6 +5417,7 @@ def open_app_window(url: str) -> None:
             )
             with BROWSER_LOCK:
                 BROWSER_PIDS.append(process.pid)
+                BROWSER_PROCESSES[process.pid] = process
             LOGGER.info("browser app window opened | pid=%s | url=%s | browser=%s", process.pid, url, browser)
             return
         except OSError:
